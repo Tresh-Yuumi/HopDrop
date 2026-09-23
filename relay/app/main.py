@@ -20,8 +20,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
 from .api.auth import router as auth_router
+from .api.boards import router as boards_router
 from .api.devices import router as devices_router
 from .api.health import router as health_router
+from .api.notes import router as notes_router
 from .api.pages import router as pages_router
 from .config import Config, load_config
 from .db import Database
@@ -200,6 +202,8 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.include_router(health_router)
     app.include_router(auth_router)
     app.include_router(devices_router)
+    app.include_router(boards_router)
+    app.include_router(notes_router)
     app.include_router(pages_router)
     return app
 

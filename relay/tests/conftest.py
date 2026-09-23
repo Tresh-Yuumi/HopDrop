@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -127,8 +128,29 @@ class RelayEnv:
             cookies={SESSION_COOKIE: token},
         )
 
+    @contextmanager
+    def paired_client(self, **env: str):
+        """已配对成主人的客户端。
+
+        M3 起几乎每个用例都需要"先配对再操作"，而配对只是一次 GET——把它
+        包起来是为了让用例的正文只剩下真正被测的那几行。
+        """
+        with self.client(**env) as client:
+            response = client.get(f"/pair/{self.room.owner_secret}")
+            assert response.status_code == 303, response.text
+            yield client
+
     def read(self, sql: str, params: tuple = ()) -> list[dict]:
         return _with_db(self.data_dir, lambda db, _cfg: db.fetchall(sql, params))
+
+    def room_rev(self) -> int:
+        """直接读库里的 rev。
+
+        刻意不走接口：`rev` 是客户端判断"要不要拉快照"的依据，断言它必须
+        看数据库里的真值，而不是看接口顺手返回的那个数——后者如果取错了
+        来源，测试会跟着一起错。
+        """
+        return int(self.read("SELECT rev FROM rooms")[0]["rev"])
 
     async def _execute(self, db: Database, _cfg, sql: str, params: tuple) -> None:
         async with db.write() as conn:

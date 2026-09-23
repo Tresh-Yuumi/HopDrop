@@ -54,6 +54,26 @@ class RoomBootstrap:
         return f"/pair/{self.owner_secret}"
 
 
+async def bump_rev(conn, room_id: str) -> int:
+    """递增房间修订号并返回新值。
+
+    **必须传入写事务里的连接，不能传 Database。** 这是刻意的签名设计：方案
+    4.3 要求 `rev` 单调、无空洞，而这个保证完全依赖于"递增与业务写入在同一个
+    `BEGIN IMMEDIATE` 事务里"。只要接受 Database，就会诱使调用方另开一次
+    写事务——两次事务之间一旦插入回滚，`rev` 就出现空洞。改成只收 conn，
+    写错的可能性从"需要小心"变成"根本写不出来"。
+
+    `UPDATE` 后再 `SELECT` 是安全的：单连接 + 全局锁串行化，两者之间不可能
+    有别的写入插进来。
+    """
+    await conn.execute("UPDATE rooms SET rev = rev + 1 WHERE id = ?", (room_id,))
+    async with conn.execute("SELECT rev FROM rooms WHERE id = ?", (room_id,)) as cursor:
+        row = await cursor.fetchone()
+    if row is None:
+        raise RuntimeError(f"递增 rev 失败：房间不存在 {room_id}")
+    return int(row[0])
+
+
 async def count_rooms(db: Database) -> int:
     row = await db.fetchone("SELECT COUNT(*) AS total FROM rooms")
     return int(row["total"]) if row else 0
