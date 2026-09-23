@@ -52,6 +52,25 @@ def _int(
     return value
 
 
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def _bool(env: Mapping[str, str], name: str, default: bool) -> bool:
+    text = _raw(env, name)
+    if text is None:
+        return default
+    lowered = text.lower()
+    if lowered in _TRUE_VALUES:
+        return True
+    if lowered in _FALSE_VALUES:
+        return False
+    raise ConfigError(
+        f"{name} 必须是布尔值（{'/'.join(sorted(_TRUE_VALUES))} 或 "
+        f"{'/'.join(sorted(_FALSE_VALUES))}），当前值：{text!r}"
+    )
+
+
 def _float(env: Mapping[str, str], name: str, default: float, *, minimum: float | None = None) -> float:
     text = _raw(env, name)
     if text is None:
@@ -80,6 +99,8 @@ class Config:
     disk_reserve_bytes: int
     data_quota_bytes: int
     guest_ttl_min: int
+    # 会话 Cookie 是否带 Secure 属性
+    cookie_secure: bool
     # 容量与分页
     cleanup_interval_sec: int
     snapshot_note_limit: int
@@ -125,6 +146,7 @@ class Config:
             "disk_reserve_bytes": self.disk_reserve_bytes,
             "data_quota_bytes": self.data_quota_bytes,
             "guest_ttl_min": self.guest_ttl_min,
+            "cookie_secure": self.cookie_secure,
             "cleanup_interval_sec": self.cleanup_interval_sec,
             "snapshot_note_limit": self.snapshot_note_limit,
             "page_size_default": self.page_size_default,
@@ -173,6 +195,9 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         disk_reserve_bytes=int(disk_reserve_gb * GIB),
         data_quota_bytes=int(data_quota_gb * GIB),
         guest_ttl_min=_int(env, "RELAY_GUEST_TTL_MIN", 120, minimum=5, maximum=1440),
+        # 默认开启。生产是 HTTPS，必须保持开启；只有本地 http://127.0.0.1
+        # 开发时才需要关掉，否则浏览器会丢弃带 Secure 的 Cookie。
+        cookie_secure=_bool(env, "RELAY_COOKIE_SECURE", True),
         cleanup_interval_sec=_int(env, "RELAY_CLEANUP_INTERVAL_SEC", 3600, minimum=60),
         snapshot_note_limit=_int(env, "RELAY_SNAPSHOT_NOTE_LIMIT", 100, minimum=1, maximum=500),
         page_size_default=_int(env, "RELAY_PAGE_SIZE_DEFAULT", 50, minimum=1, maximum=500),

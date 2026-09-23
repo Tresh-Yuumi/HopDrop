@@ -10,10 +10,15 @@
 relay/                  服务端
   app/                  应用代码
     api/                HTTP 接口，每个模块一个 router
+    cli.py              管理命令：init / rotate
     config.py           RELAY_* 环境变量加载与校验
     db.py               单连接 + 全局锁的数据访问层
-    migrations.py       顺序 SQL 迁移执行器
+    devices.py          设备与配对的存取
     errors.py           统一错误信封
+    identity.py         会话解析与权限依赖
+    migrations.py       顺序 SQL 迁移执行器
+    rooms.py            房间引导（含两个初始区域）
+    security.py         随机值与哈希
     state.py            进程内运行时状态
   migrations/           NNNN_名称.sql，启动时自动应用
   tests/                pytest
@@ -27,9 +32,27 @@ deploy/                 Caddyfile、systemd unit、备份脚本
 python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r relay/requirements-dev.txt   # Windows
 # .venv/bin/pip install -r relay/requirements-dev.txt                    # Linux
-
-cd relay && ../.venv/Scripts/python.exe -m app
 ```
+
+第一步是**创建房间**。产品没有注册接口，房间是运维动作，所以走命令行：
+
+```bash
+cd relay && ../.venv/Scripts/python.exe -m app.cli init
+```
+
+它会创建房间和两个初始区域（**日常**，永久；**访客区**，30 天滑动），并打印主人链接。**这条链接要离线保存**——服务端只存它的哈希，丢了只能重新生成：
+
+```bash
+python -m app.cli rotate        # 重置主人链接；已配对设备不受影响
+```
+
+然后启动服务。本地必须关掉 Cookie 的 `Secure` 属性，否则浏览器会直接丢弃它（生产是 HTTPS，保持默认开启即可）：
+
+```bash
+cd relay && RELAY_COOKIE_SECURE=0 ../.venv/Scripts/python.exe -m app
+```
+
+浏览器打开上面打印的 `/pair/...` 路径即可完成配对，随后会跳到 `/app`。
 
 另开一个终端验证：
 
@@ -37,7 +60,7 @@ cd relay && ../.venv/Scripts/python.exe -m app
 curl -i 127.0.0.1:8080/healthz
 ```
 
-本地开发不需要 HTTPS：浏览器把 `http://127.0.0.1` 视为安全上下文，剪贴板 API 照常可用。
+本地开发不需要 HTTPS：浏览器把 `http://127.0.0.1` 视为安全上下文，剪贴板 API 照常可用。但 `Secure` 与 `SameSite=Strict` 两个 Cookie 属性在纯 HTTP 下会拦住会话，所以本地开发必须显式设置 `RELAY_COOKIE_SECURE=0`。
 
 测试：
 
@@ -62,13 +85,15 @@ cd relay && ../.venv/Scripts/python.exe -m pytest -q
 3. **迁移只增不改。** 已经用过的迁移文件不得修改，结构变更一律新增文件。文件名必须是 `NNNN_名称.sql`。
 4. **DDL 的关键约束不动。** 尤其是 `files.size` 的 1..20971520、`boards` 的两条 CHECK、`uq_boards_guest` 部分唯一索引。
 5. **文件只有在完整校验并原子落盘后才算上传成功**；权限校验基于 `file.room_id`；文本与其他用户输入一律 HTML 转义，纯文本渲染。
+6. **`security.hash_token` 只用于高熵凭证**（会话令牌、主人 secret）。6 位访客码是 10^6 的取值空间，用它等于明文存储，M9 必须改用带盐的慢哈希（`hashlib.scrypt`）。
+7. **权限从会话反查，不信任客户端传入的 `roomId` / `role`**；跨房间的资源一律返回 404（不是 403），避免泄漏存在性。
 
 ## 里程碑
 
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | M1 | 工程骨架与数据库基线：config / db / 迁移 / healthz / 错误信封 / 部署件 | 已完成 |
-| M2 | 身份、配对与长期登录 | 待做 |
+| M2 | 身份、配对与长期登录：房间引导 / `/pair` / 会话 / 设备管理 / 来源校验 | 已完成 |
 | M3 | 文本区与消息 CRUD（含 `mutation_id` 幂等与 `rooms.rev`） | 待做 |
 | M4 | WebSocket 推送与快照对齐 | 待做 |
 | M5 | 前端页面（文本闭环可点通） | 待做 |
@@ -89,7 +114,27 @@ M1–M6 构成方案的阶段 1（文本闭环）。M9 与 M10 是纯新增模�
 - **清理任务**（M8）。`/healthz` 的 `lastCleanupAt` 现在是 `null`，代码不会假装它跑过。接入后 14.5 里"清理任务超过 3 小时未成功即 degraded"才开始生效。
 - **WebSocket**（M4）。`websocketConnections` 现在恒为 `0`。
 - **OpenAPI / Swagger UI 已关闭**。文档页要从 CDN 取资源，既被本项目的 CSP 挡住，也多一处对外接口面。接口验证靠测试。
-- **根路径 `/` 尚未提供页面**（M5）。在 M5 之前访问会返回 404 信封。
+- **`/` 与 `/app` 目前是临时页面**（`app/api/pages.py`，M5 替换）。它们存在的唯一原因是让 M2 的"长期登录"能在浏览器里被看见，因此不使用任何内联样式或脚本（会被部署时的 CSP 拦掉），也不引入模板引擎。
+
+### M2 完成范围与已知缺口
+
+已完成：`python -m app.cli init/rotate`；`GET /pair/{secret}` 全自动配对（303 跳转，secret 不进地址栏）；Cookie 会话（HttpOnly / Secure / SameSite=Strict / Max-Age，库中只存 SHA-256）；`GET|PATCH|DELETE /api/devices`、`POST /api/owner-secret/rotate`、`POST /api/session/logout`；写请求的 Origin 校验；`last_seen_at` 节流刷新。
+
+尚未接入，属后续里程碑：
+
+- **限流**（M9）。方案 12 的"主人读 120 / 写 60 次每分钟"等还没实现。
+- **访客码**（M9）。`POST /api/guest/enter` 与 `guest_codes` 表已就位但无代码路径。**实现时必须用带盐的慢哈希**，不得复用 `security.hash_token`（6 位数字用 SHA-256 等于明文，见该模块的说明）。
+- **WebSocket 的撤销生效**（M4）。目前撤销对 HTTP 是立即生效；方案 3.3 要求"现有 WebSocket 在下一次心跳或权限检查时关闭"，等 M4 有了连接表再实现。
+
+### 两处对方案的补充
+
+1. **`DELETE /api/devices`**（集合级）= 撤销除当前设备外的全部设备。方案 3.3 要求这个操作，但 9.2 的接口表里只有按 ID 的单台撤销，没有集合入口。
+2. **`RELAY_COOKIE_SECURE`** 配置项，默认 `true`。方案要求 `Secure`，这对生产（HTTPS）是唯一正确取值；但本地 `http://127.0.0.1` 下浏览器会丢弃带 `Secure` 的 Cookie，开发时需要一个显式开关。启动时若它被关闭会打一条 warning。
+
+另外两处**方案留白、由实现取定**的默认值，需要产品侧确认：
+
+- **初始区域"日常"取永久保留**（`retention = 0`）。方案只说"新建时选 30/60/永久"，没说初始区域的寿命。取永久的理由是 0.3 的红线——默认落地页静默归档会让用户直接失去写入能力。
+- **设备的 `last_seen_at` 刷新不递增 `rooms.rev`**。它只出现在设备列表，不进消息流；若算作"影响客户端界面的写入"，每台设备每 60 秒就会引发一次全客户端快照重拉。
 
 ## 已知环境注意事项
 
