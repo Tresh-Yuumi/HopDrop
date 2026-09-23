@@ -1,0 +1,6 @@
+# 运行时依赖。刻意只有四个（方案 2.2 第 6 条）。
+# 不引入 SQLAlchemy、Alembic、Redis 客户端、模板引擎。
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+aiosqlite>=0.20,<1.0
+python-multipart>=0.0.9,<1.0

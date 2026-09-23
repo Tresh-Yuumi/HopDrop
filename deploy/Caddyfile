@@ -1,0 +1,33 @@
+# HopDrop 反向代理配置（方案 14.3）
+#
+# 用法：把 {$RELAY_DOMAIN} 通过环境变量传给 Caddy，或直接替换成实际域名。
+# 域名与备案信息见方案第 17 节。
+#
+# 证书由 Caddy 自动申请与续期，前置条件是 80 / 443 可从公网访问、
+# 且域名解析已指向本机。备案未完成时 80 端口会被拦截，证书签不下来。
+
+{$RELAY_DOMAIN:relay.example.com} {
+	encode zstd gzip
+
+	header {
+		Referrer-Policy "no-referrer"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		Content-Security-Policy "default-src 'self'; connect-src 'self' wss:; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+		-Server
+	}
+
+	reverse_proxy 127.0.0.1:8080
+
+	# 25 MB 是单请求兜底，实际单文件上限由应用按 20 MiB 校验。
+	request_body {
+		max_size 25MB
+	}
+
+	# 访问日志默认关闭：URL 里会带房间与区域标识。
+	# 需要排查时再临时打开，并注意日志脱敏。
+	log {
+		output discard
+	}
+}
