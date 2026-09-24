@@ -16,11 +16,15 @@ relay/                  服务端
     db.py               单连接 + 全局锁的数据访问层
     devices.py          设备与配对的存取
     errors.py           统一错误信封
+    events.py           提交后要广播的变更（数据层与传输层的中立类型）
     identity.py         会话解析与权限依赖
     migrations.py       顺序 SQL 迁移执行器
     notes.py            消息：幂等、编辑、软删除
+    origin.py           同源判定（HTTP 写请求与 WebSocket 握手共用）
+    realtime.py         WebSocket 连接表与按房间广播
     rooms.py            房间引导（含两个初始区域）与 rev 递增
     security.py         随机值与哈希
+    snapshot.py         全量快照组装
     state.py            进程内运行时状态
   migrations/           NNNN_名称.sql，启动时自动应用
   tests/                pytest
@@ -97,7 +101,7 @@ cd relay && ../.venv/Scripts/python.exe -m pytest -q
 | M1 | 工程骨架与数据库基线：config / db / 迁移 / healthz / 错误信封 / 部署件 | 已完成 |
 | M2 | 身份、配对与长期登录：房间引导 / `/pair` / 会话 / 设备管理 / 来源校验 | 已完成 |
 | M3 | 文本区与消息 CRUD（含 `mutation_id` 幂等与 `rooms.rev`） | 已完成 |
-| M4 | WebSocket 推送与快照对齐 | 待做 |
+| M4 | WebSocket 推送与快照对齐 | 已完成 |
 | M5 | 前端页面（文本闭环可点通） | 待做 |
 | M6 | 首次真部署（Caddy + systemd + HTTPS） | 待做 |
 | M7 | 文件上传与下载 | 待做 |
@@ -141,8 +145,30 @@ M1–M6 构成方案的阶段 1（文本闭环）。M9 与 M10 是纯新增模�
 
 - **归档、恢复、清空访客区**（M9）：`POST /api/boards/{id}/archive|restore|clear`。到期区域目前会拒绝追加消息（`409 board_expired`），但转成 `archived` 状态要等 M8 的清理任务。
 - **回收站恢复**（M9）：`POST /api/notes/{id}/restore`。软删除已经生效，7 天后的硬删除在 M8。
-- **快照**（M4）：`GET /api/snapshot`。前端暂时只能用 `/api/boards` + `/api/boards/{id}/notes` 拼出界面。
 - **搜索**（M10）、**导出**（M9）、**限流**（M9）。
+
+### M4 完成范围与已知缺口
+
+已完成：`GET /api/snapshot`（可见区域 + 每区最近 N 条 + 当前 `rev`，且**同一持锁内读完**）；`/ws` 连接（Origin 校验 → Cookie 会话校验 → `hello.ok` → 心跳 / 重鉴权）；写事务提交后按房间广播 `changed`；`DELETE /api/devices` 与 `DELETE /api/devices/{id}` 会**当场**断掉被撤销设备的连接；`/healthz` 的 `websocketConnections` 反映真实连接数。
+
+三条实现上的取定：
+
+1. **广播是尽力而为的，一致性由快照兜底。** 推送不重试、不落库、不补发；客户端发现本地 `rev` 与服务端对不上就拉一次 `/api/snapshot`。因此"丢推送"不是错误路径，而是一条需要客户端收尾的正常路径——这也是本项目不做持久化事件流的原因（方案 4.3）。事件在**事务提交之后、全局写锁释放之后**才发出：回滚不留痕迹，`rev` 不会出现空洞，慢发送也不会卡住写入。
+2. **`/api/snapshot` 在同一次持锁里读完 `rev` 与内容。** 分两次读会产出"rev = N，但内容是 N+1"的快照，客户端据此会把一条变更应用两遍、界面上出现重复消息。
+3. **WebSocket 只收心跳与握手，不接受任何业务写入。** 业务写一律走 HTTP（方案 10 最后一条）：两条通道都能写就得把幂等、来源校验、可见性实现两遍，而两份实现迟早分叉。
+
+尚未接入，属后续里程碑：
+
+- **`files` 恒为空数组**（M7）。快照里保留这个键而不是省掉它，是为了让 M5 的前端按最终形状写渲染逻辑，M7 接进来时不需要改前端。
+- **二进制帧只回 `bad_message`，不断开**（无计划）。协议里没有它的位置，但为一条打错的帧断线只会制造无谓的重连。
+- **重鉴权间隔 60 秒**（`REAUTH_INTERVAL_SEC`）。这是"绕过接口直接改库"的兜底；正常撤销路径是接口当场断开，不走这里。
+
+**两处对方案的补充**：
+
+1. **服务端 `accept` 之后主动发一次 `hello.ok`，不等客户端的 `hello`。** 省掉一个往返，前端也不必处理"连上了但迟迟没有 hello.ok"的超时分支。客户端的 `hello` 仍会被响应（内容相同），所以按方案时序实现的客户端也能工作——代价是 `hello.ok` 可能出现两次，客户端必须幂等处理。
+2. **撤销设备时立即断开 WebSocket，不等下一次心跳。** 方案 3.3 的下限是"下一次心跳或权限检查时关闭"，但撤销的用意就是马上切断：在那最多 60 秒的窗口里，被撤销的设备仍在接收房间的全部推送。HTTP 侧本来就已经是立即 401，WebSocket 侧没有理由慢一拍。
+
+为了让连接限额可测，新增了三个配置项 `RELAY_WS_ROOM_LIMIT`（默认 20）、`RELAY_WS_IP_LIMIT`（默认 10）、`RELAY_WS_IDLE_TIMEOUT_SEC`（默认 60）。生产保持方案默认值。
 
 ### 四处对方案的补充与取定
 

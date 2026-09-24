@@ -98,17 +98,17 @@ async def _touch_last_seen(db: Database, row: dict, now: int) -> None:
         logger.warning("刷新 last_seen_at 失败 device_id=%s", row["device_id"], exc_info=True)
 
 
-async def resolve_session(request: Request) -> AuthContext | None:
-    """从 Cookie 解析会话。无效或已撤销时返回 None，不抛异常。
+async def resolve_session_token(db: Database, token: str | None) -> AuthContext | None:
+    """用令牌明文解析会话。
 
-    返回 None 的那种调用方（首页、配对入口）需要自行决定如何响应；
-    需要强制登录的接口用 `current_session` / `current_owner`。
+    这是唯一的解析入口：HTTP 从 Cookie 取令牌后调它，WebSocket 握手也从
+    Cookie 取令牌后调它。两条通道共用一份逻辑，是因为"什么算有效会话"必须
+    只有一个答案——会话过期、设备被撤销这些条件如果在两条路径上各写一遍，
+    迟早会出现"HTTP 已经 401 但 WebSocket 还连着"的缝。
     """
-    token = request.cookies.get(SESSION_COOKIE)
     if not token:
         return None
 
-    db: Database = request.app.state.db
     row = await db.fetchone(_SESSION_SQL, (hash_token(token),))
     if row is None:
         return None
@@ -128,6 +128,16 @@ async def resolve_session(request: Request) -> AuthContext | None:
         role=row["role"],
         session_id=row["session_id"],
     )
+
+
+async def resolve_session(request: Request) -> AuthContext | None:
+    """从 Cookie 解析会话。无效或已撤销时返回 None，不抛异常。
+
+    返回 None 的那种调用方（首页、配对入口）需要自行决定如何响应；
+    需要强制登录的接口用 `current_session` / `current_owner`。
+    """
+    db: Database = request.app.state.db
+    return await resolve_session_token(db, request.cookies.get(SESSION_COOKIE))
 
 
 def set_session_cookie(response, token: str, *, secure: bool) -> None:

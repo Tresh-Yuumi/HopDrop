@@ -25,14 +25,18 @@ from typing import Any
 from .boards import assert_board_writable, load_board, refresh_guest_expiry
 from .db import Database
 from .errors import AppError
+from .events import EVENT_NOTE_CREATED, EVENT_NOTE_DELETED, EVENT_NOTE_UPDATED
 from .rooms import bump_rev
 from .security import new_id
 
 MUTATION_ID_MAX = 64
 MUTATION_ID_ALLOWED = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
 
-_NOTE_SELECT = """
-SELECT n.id,
+# 列清单与 FROM 子句拆开，是因为快照（`snapshot.py`）要在外面再包一层
+# CTE 来取"每个区域最近 N 条"。让它复用这两段，比在那里重抄一遍列名安全：
+# 漏抄一个字段的症状是"快照里少了某个字段"，而接口侧完全正常。
+NOTE_COLUMNS = """
+       n.id,
        n.room_id,
        n.board_id,
        n.author_id,
@@ -49,10 +53,15 @@ SELECT n.id,
        b.retention    AS board_retention,
        b.expires_at   AS board_expires_at,
        d.name         AS author_name
+"""
+
+NOTE_FROM = """
 FROM notes n
 JOIN boards b ON b.id = n.board_id
 LEFT JOIN devices d ON d.id = n.author_id
 """
+
+_NOTE_SELECT = f"SELECT {NOTE_COLUMNS} {NOTE_FROM}"
 
 
 def normalize_mutation_id(raw: object) -> str:
@@ -252,10 +261,22 @@ async def create_note(
             (note_id, room_id, board_id, device_id, content, mutation_id, now, now),
         )
         await refresh_guest_expiry(db, board=board, now=now, conn=conn)
-        await bump_rev(conn, room_id)
+        rev = await bump_rev(conn, room_id)
+        # 在事务内取回这一行，而不是提交后再查一次：广播要用的 `rev` 与要广播
+        # 的内容必须来自同一个事务，否则客户端可能收到一条与 rev 对不上的内容
+        # ——它按"rev 正好 +1"增量应用，结果应用错了东西。
+        #
+        # 取行也必须排在 refresh_guest_expiry 之后：卡片上带的到期时间是本次
+        # 续期后的值，而不是续期前的。
+        created = await db.fetchone(_NOTE_SELECT + " WHERE n.id = ?", (note_id,), conn=conn)
+        assert created is not None
+        db.queue_event(
+            room_id=room_id,
+            rev=rev,
+            event=EVENT_NOTE_CREATED,
+            payload={"note": serialize_note(created)},
+        )
 
-    created = await db.fetchone(_NOTE_SELECT + " WHERE n.id = ?", (note_id,))
-    assert created is not None
     return created, True
 
 
@@ -305,10 +326,16 @@ async def update_note(
         await conn.execute(
             f"UPDATE notes SET {', '.join(assignments)} WHERE id = ?", tuple(params)
         )
-        await bump_rev(conn, room_id)
+        rev = await bump_rev(conn, room_id)
+        updated = await db.fetchone(_NOTE_SELECT + " WHERE n.id = ?", (note_id,), conn=conn)
+        assert updated is not None
+        db.queue_event(
+            room_id=room_id,
+            rev=rev,
+            event=EVENT_NOTE_UPDATED,
+            payload={"note": serialize_note(updated)},
+        )
 
-    updated = await db.fetchone(_NOTE_SELECT + " WHERE n.id = ?", (note_id,))
-    assert updated is not None
     return updated
 
 
@@ -334,4 +361,12 @@ async def soft_delete_note(
         if row["board_status"] != "active":
             raise AppError.conflict("该区域已归档，内容不可修改", "board_archived")
         await conn.execute("UPDATE notes SET deleted_at = ? WHERE id = ?", (now, note_id))
-        await bump_rev(conn, room_id)
+        rev = await bump_rev(conn, room_id)
+        # 删除的广播只带 id，不带被删的正文——正文已经没有任何客户端该显示了，
+        # 再往外发一遍只是徒增一次内容分发面。客户端按 id 把它从列表里摘掉。
+        db.queue_event(
+            room_id=room_id,
+            rev=rev,
+            event=EVENT_NOTE_DELETED,
+            payload={"noteId": note_id, "boardId": row["board_id"]},
+        )

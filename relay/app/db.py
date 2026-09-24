@@ -6,21 +6,49 @@ asyncio.Lock 串行化。** 本项目写入频率极低（主人写 60 次/分�
 
 三条硬约束：
 1. 锁不可重入。write()/read() 块内部不得再调用 write()/read()，
-   否则同一个 task 会自己等自己，直接死锁。
+   否则同一个 task 会自己等自己，直接死锁。需要"一次持锁读完几样东西"时，
+   把连接（conn 参数）往下传，而不是再开一个 read()。
 2. 写事务必须显式 BEGIN IMMEDIATE / COMMIT。用 IMMEDIATE 是刻意的：
    一开始就拿写锁，避免"读升级为写"时才发现冲突。
 3. 行结果一律用 fetchall()/fetchone() 转成 dict。不用 row_factory，
    因为它是 sqlite3 连接级状态，在 aiosqlite 的封装下行为不够直白。
+
+---
+
+**写事务与广播的绑定关系（M4 加的，理解广播语义的关键）：**
+
+写事务内调用 `queue_event()` 登记"这次提交后要通知谁"，`write()` 在 COMMIT
+成功之后、**释放锁之后**统一交给事件汇（`set_event_sink` 注册的回调，实际
+就是 WebSocket 广播）。
+
+这样安排解决三件事：
+
+- **回滚不留痕迹**：事务失败时待发事件被丢弃，客户端不会收到一条数据库里
+  并不存在的变更；
+- **不会出现 rev 空洞的广播**：事件里的 rev 是事务内 `bump_rev` 的返回值，
+  提交成功才发出去，客户端收到的一定是连续的那一个；
+- **广播失败不污染写入**：发送异常在本层被兜住，`write()` 正常返回。
+
+发事件时**不持锁**：广播要 await 网络发送，持着全局写锁做这件事会把整个
+服务卡在一次慢发送上。
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterable, Sequence
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Sequence
 
 import aiosqlite
+
+from .events import RoomEvent
+
+logger = logging.getLogger("relay.db")
+
+# 事件汇的签名：收一批已提交的事件，返回时表示"尽力发过了"。
+EventSink = Callable[[Sequence[RoomEvent]], Awaitable[None]]
 
 
 def _rows_to_dicts(cursor: aiosqlite.Cursor, rows: Iterable[Sequence[Any]]) -> list[dict[str, Any]]:
@@ -37,6 +65,28 @@ class Database:
         self._busy_timeout_ms = busy_timeout_ms
         self._conn: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
+        self._event_sink: EventSink | None = None
+        # 当前写事务待发的事件。`None` 表示"现在不在写事务里"——`queue_event`
+        # 靠它把"在事务外登记事件"这种写错法变成一次明确的报错。
+        self._pending_events: list[RoomEvent] | None = None
+
+    def set_event_sink(self, sink: EventSink | None) -> None:
+        """注册事件汇。装配期调用一次；不注册等于"只写库、不广播"。"""
+        self._event_sink = sink
+
+    def queue_event(
+        self, *, room_id: str, rev: int, event: str, payload: dict[str, Any]
+    ) -> None:
+        """登记一条"提交后要广播"的变更。**只能在 `write()` 块内调用。**
+
+        刻意是同步方法：它只往列表里放一个对象，不该让调用方以为这里有
+        什么可以 await 的东西——真正的发送发生在 COMMIT 之后。
+        """
+        if self._pending_events is None:
+            raise RuntimeError("queue_event 只能在 db.write() 事务内调用")
+        self._pending_events.append(
+            RoomEvent(room_id=room_id, rev=rev, event=event, payload=payload)
+        )
 
     @property
     def path(self) -> Path:
@@ -88,15 +138,27 @@ class Database:
 
     @asynccontextmanager
     async def write(self) -> AsyncIterator[aiosqlite.Connection]:
+        events: list[RoomEvent] = []
         async with self._lock:
             await self.conn.execute("BEGIN IMMEDIATE")
+            self._pending_events = []
             try:
                 yield self.conn
             except BaseException:
+                self._pending_events = None
                 await self.conn.execute("ROLLBACK")
                 raise
             else:
                 await self.conn.execute("COMMIT")
+                events = self._pending_events
+                self._pending_events = None
+
+        # 锁已释放，这里再广播。理由见模块说明。
+        if events and self._event_sink is not None:
+            try:
+                await self._event_sink(events)
+            except Exception:  # noqa: BLE001 - 广播是尽力而为的，不能反过来影响写入
+                logger.exception("广播变更失败 事件数=%d", len(events))
 
     # ---- 查询辅助 ----
 

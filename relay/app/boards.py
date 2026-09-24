@@ -26,6 +26,7 @@ from typing import Any
 
 from .db import Database
 from .errors import AppError
+from .events import EVENT_BOARD_CREATED, EVENT_BOARD_UPDATED
 from .rooms import bump_rev
 from .security import new_id
 
@@ -213,12 +214,16 @@ async def list_boards(
     status: str = "active",
     limit: int,
     cursor: str | None = None,
+    conn: Any | None = None,
 ) -> tuple[list[dict], str | None]:
     """分页列出可见区域。返回 (行, nextCursor)。
 
     `status` 参数是为"已归档"导航（方案 11.2）留的：归档区在同一个区域
     资源集合里，只是状态不同。9.3 的接口表没有单列归档列表接口，所以这里
     用一个查询参数表达，而不是另造一个 `/api/archives`。
+
+    `conn` 由调用方传入，用于"已经持锁"的场景（快照要把 rev 与内容读在
+    同一次持锁里）。不要为它另开一次 `db.read()`——锁不可重入。
     """
     conditions = ["b.room_id = ?", "b.status = ?"]
     params: list[Any] = [room_id, status]
@@ -229,7 +234,7 @@ async def list_boards(
         anchor = await db.fetchone(
             _BOARD_SELECT + " WHERE b.id = ?",
             (cursor,),
-            conn=None,
+            conn=conn,
         )
         if anchor is None or anchor["room_id"] != room_id:
             # 游标失效（区域被清理掉）时的正确处理是 400 而不是静默从头开始：
@@ -254,6 +259,7 @@ async def list_boards(
     rows = await db.fetchall(
         _BOARD_SELECT + " WHERE " + " AND ".join(conditions) + f" ORDER BY {_ORDER_KEYS} LIMIT ?",
         tuple(params),
+        conn=conn,
     )
     has_more = len(rows) > limit
     rows = rows[:limit]
@@ -323,10 +329,18 @@ async def create_board(
                 now,
             ),
         )
-        await bump_rev(conn, room_id)
+        rev = await bump_rev(conn, room_id)
+        # 广播要用的 rev 与要广播的内容必须来自同一个事务，见 notes.create_note
+        # 的同款说明。这里在事务内取回整行，顺带把提交后那次查询也省了。
+        created = await db.fetchone(_BOARD_SELECT + " WHERE b.id = ?", (board_id,), conn=conn)
+        assert created is not None
+        db.queue_event(
+            room_id=room_id,
+            rev=rev,
+            event=EVENT_BOARD_CREATED,
+            payload={"board": serialize_board(created, now=now)},
+        )
 
-    created = await db.fetchone(_BOARD_SELECT + " WHERE b.id = ?", (board_id,))
-    assert created is not None
     return created
 
 
@@ -393,8 +407,14 @@ async def update_board(
         await conn.execute(
             f"UPDATE boards SET {', '.join(assignments)} WHERE id = ?", tuple(params)
         )
-        await bump_rev(conn, room_id)
+        rev = await bump_rev(conn, room_id)
+        updated = await db.fetchone(_BOARD_SELECT + " WHERE b.id = ?", (board_id,), conn=conn)
+        assert updated is not None
+        db.queue_event(
+            room_id=room_id,
+            rev=rev,
+            event=EVENT_BOARD_UPDATED,
+            payload={"board": serialize_board(updated, now=now)},
+        )
 
-    updated = await db.fetchone(_BOARD_SELECT + " WHERE b.id = ?", (board_id,))
-    assert updated is not None
     return updated

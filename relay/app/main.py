@@ -11,7 +11,6 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -25,10 +24,13 @@ from .api.devices import router as devices_router
 from .api.health import router as health_router
 from .api.notes import router as notes_router
 from .api.pages import router as pages_router
+from .api.realtime import router as realtime_router
 from .config import Config, load_config
 from .db import Database
 from .errors import DEFAULT_CODES, AppError, error_payload
 from .migrations import apply_migrations
+from .origin import same_origin
+from .realtime import ConnectionManager
 from .state import RuntimeState
 
 # uvicorn 只配置它自己的 logger，不会给 root 装 handler。
@@ -51,37 +53,18 @@ def _request_id(request: Request) -> str:
     return getattr(request.state, "request_id", "unknown")
 
 
-def _same_origin(request: Request) -> bool:
-    """写请求的 Origin 校验（方案 9.1）。
-
-    判定方式是同源比较：Origin 的 netloc 必须等于 Host 头。这个比较在开发和
-    生产都成立——浏览器发 Origin 时用的就是访问时那个主机名，而 Host 头正是
-    同一个值，所以不需要任何配置项。
-
-    两种情况刻意放行 / 拒绝：
-
-    - **没有 Origin 头 → 放行。** 非浏览器客户端（curl、测试、监控）不带这个
-      头，而 CSRF 必须借助浏览器才能发生。再加上会话 Cookie 是
-      `SameSite=Strict`，跨站请求本来就带不上凭证，这里是第二道防线而非第一道。
-    - **`Origin: null` → 拒绝。** 它来自 `file://`、`data:` 或沙箱 iframe，
-      没有任何一种属于本应用的正常用法。
-    """
-    origin = request.headers.get("origin")
-    if origin is None:
-        return True
-    if origin == "null":
-        return False
-    parsed = urlsplit(origin)
-    if parsed.scheme not in ("http", "https"):
-        return False
-    host = request.headers.get("host", "")
-    return bool(host) and parsed.netloc == host
-
-
 def create_app(config: Config | None = None) -> FastAPI:
     cfg = config if config is not None else load_config()
     db = Database(cfg.db_path)
     runtime = RuntimeState()
+    # 连接表必须先于 db 建好：db 的事件汇指向它，写事务提交后直接广播。
+    # 反过来（先建 db 再注入）也行，但"先有消费者再有生产者"读起来更顺。
+    realtime_manager = ConnectionManager(
+        state=runtime,
+        room_limit=cfg.ws_room_limit,
+        ip_limit=cfg.ws_ip_limit,
+    )
+    db.set_event_sink(realtime_manager.publish)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -114,6 +97,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.state.config = cfg
     app.state.db = db
     app.state.runtime = runtime
+    app.state.realtime = realtime_manager
 
     @app.middleware("http")
     async def attach_request_context(request: Request, call_next):
@@ -129,7 +113,10 @@ def create_app(config: Config | None = None) -> FastAPI:
         if (
             request.method in UNSAFE_METHODS
             and request.url.path.startswith("/api/")
-            and not _same_origin(request)
+            and not same_origin(
+                origin=request.headers.get("origin"),
+                host=request.headers.get("host"),
+            )
         ):
             logger.warning(
                 "拒绝跨源写请求 requestId=%s method=%s path=%s origin=%s",
@@ -204,6 +191,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.include_router(devices_router)
     app.include_router(boards_router)
     app.include_router(notes_router)
+    app.include_router(realtime_router)
     app.include_router(pages_router)
     return app
 

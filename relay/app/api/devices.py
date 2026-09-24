@@ -21,6 +21,7 @@ from ..db import Database
 from ..devices import list_devices, rename_device, revoke_device, revoke_other_devices
 from ..errors import AppError
 from ..identity import AuthContext, current_owner, current_session
+from ..realtime import ConnectionManager
 from ..rooms import rotate_owner_secret
 
 router = APIRouter(prefix="/api")
@@ -91,11 +92,19 @@ async def delete_device(
 
     允许主人撤销自己当前这台（语义等同于登出）。界面上不提供这个入口，
     但接口层不额外禁止——禁止它只会制造一个"看起来该能用却报错"的分支。
+
+    **撤销后立刻断掉该设备的 WebSocket。** 方案 3.3 的下限是"下一次心跳或
+    权限检查时关闭"，但这里不等心跳：撤销的用意就是马上切断，而在这最多
+    60 秒的窗口里，那台设备还在接收房间的全部推送内容。HTTP 侧已经是立即
+    401，WebSocket 侧没有理由慢一拍。
     """
     db: Database = request.app.state.db
     revoked = await revoke_device(db, room_id=context.room_id, device_id=device_id)
     if not revoked:
         raise AppError.not_found("设备不存在")
+
+    manager: ConnectionManager = request.app.state.realtime
+    await manager.close_connections(device_ids=[device_id])
 
 
 @router.delete("/devices")
@@ -107,6 +116,10 @@ async def delete_other_devices(
     db: Database = request.app.state.db
     revoked = await revoke_other_devices(
         db, room_id=context.room_id, keep_device_id=context.device_id
+    )
+    manager: ConnectionManager = request.app.state.realtime
+    await manager.close_connections(
+        room_id=context.room_id, keep_device_id=context.device_id
     )
     return {"revoked": revoked}
 

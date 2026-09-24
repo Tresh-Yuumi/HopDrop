@@ -108,6 +108,10 @@ class Config:
     page_size_max: int
     note_max_bytes: int
     board_note_limit: int
+    # WebSocket（方案 10）
+    ws_room_limit: int
+    ws_ip_limit: int
+    ws_idle_timeout_sec: int
     # 原始值，仅用于日志展示
     raw_disk_reserve_gb: float = field(default=3.0, repr=False)
     raw_data_quota_gb: float = field(default=3.0, repr=False)
@@ -151,6 +155,9 @@ class Config:
             "snapshot_note_limit": self.snapshot_note_limit,
             "page_size_default": self.page_size_default,
             "page_size_max": self.page_size_max,
+            "ws_room_limit": self.ws_room_limit,
+            "ws_ip_limit": self.ws_ip_limit,
+            "ws_idle_timeout_sec": self.ws_idle_timeout_sec,
         }
 
 
@@ -204,6 +211,14 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         page_size_max=_int(env, "RELAY_PAGE_SIZE_MAX", 200, minimum=1, maximum=1000),
         note_max_bytes=_int(env, "RELAY_NOTE_MAX_BYTES", 64 * 1024, minimum=256),
         board_note_limit=_int(env, "RELAY_BOARD_NOTE_LIMIT", 20000, minimum=100),
+        # 方案 10 的连接上限：单房间 20、单 IP 10。做成可配置不是为了调优，
+        # 而是为了让限额本身可测——用 21 条连接验证上限的测试跑起来太慢。
+        # 生产保持默认值。
+        ws_room_limit=_int(env, "RELAY_WS_ROOM_LIMIT", 20, minimum=1, maximum=1000),
+        ws_ip_limit=_int(env, "RELAY_WS_IP_LIMIT", 10, minimum=1, maximum=1000),
+        # 方案 10：客户端每 25 秒 ping，服务端 60 秒未收到活动即关闭。
+        # 下限放到 1 秒同样是为了可测。
+        ws_idle_timeout_sec=_int(env, "RELAY_WS_IDLE_TIMEOUT_SEC", 60, minimum=1, maximum=600),
         raw_disk_reserve_gb=disk_reserve_gb,
         raw_data_quota_gb=data_quota_gb,
         raw_room_file_quota_gb=room_file_quota_gb,
