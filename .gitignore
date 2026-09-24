@@ -4,6 +4,8 @@ venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+# 排查问题时用 --basetemp 指定的固定临时目录（见 README 的环境注意事项）
+.pytest-tmp/
 
 # 运行期数据（本地开发默认写在 relay/data）
 relay/data/

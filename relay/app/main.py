@@ -15,6 +15,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
@@ -31,6 +32,7 @@ from .errors import DEFAULT_CODES, AppError, error_payload
 from .migrations import apply_migrations
 from .origin import same_origin
 from .realtime import ConnectionManager
+from .security_headers import SECURITY_HEADERS
 from .state import RuntimeState
 
 # uvicorn 只配置它自己的 logger，不会给 root 装 handler。
@@ -43,10 +45,13 @@ logging.basicConfig(
 logger = logging.getLogger("relay")
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
-
+WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
 # 需要校验来源的方法。GET / HEAD / OPTIONS 是安全方法，不做校验。
 UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+# 静态资源的前缀。它们需要缓存，其他响应一律不缓存（方案 9.1）。
+STATIC_PREFIX = "/static/"
 
 
 def _request_id(request: Request) -> str:
@@ -136,12 +141,20 @@ def create_app(config: Config | None = None) -> FastAPI:
 
         response.headers["X-Request-Id"] = request.state.request_id
         # 方案 9.1：API 响应使用 Cache-Control: no-store。
-        # M5 接入静态资源后要放开静态目录，那些文件需要缓存。
-        response.headers["Cache-Control"] = "no-store"
-        # 方案 12 要求配对响应设置 no-referrer。这里全局设置而不是只给
-        # /pair：地址栏里的区域、消息 ID 同样不该顺着 Referer 漏给外站，
-        # 而全局设置没有任何一处会因此变坏。Caddy 也会下一份，两处一致。
-        response.headers["Referrer-Policy"] = "no-referrer"
+        #
+        # `/static/` 是唯一的例外，而且必须是例外：CSS 与 JS 带 no-store 时
+        # 每次导航都要重新下载，而它们恰恰是最该被复用的东西。
+        #
+        # 给的是 `no-cache` 而不是 `max-age=...`：本项目没有构建步骤，文件名
+        # 里没有内容哈希，一旦给了 max-age，改了 CSS 之后浏览器在有效期内不会
+        # 回来问，用户看到的是新旧混合的界面。`no-cache` 配合 StaticFiles 自动
+        # 产生的 ETag，正常情况返回 304 空响应体——既省流量，又不会拿旧的。
+        cache_control = "no-cache" if request.url.path.startswith(STATIC_PREFIX) else "no-store"
+        response.headers["Cache-Control"] = cache_control
+        # 安全响应头在应用内也下发一份，理由见 security_headers 的模块说明。
+        # 与 Caddyfile 里那一份由测试逐条锁住一致性。
+        for name, value in SECURITY_HEADERS:
+            response.headers[name] = value
         return response
 
     @app.exception_handler(AppError)
@@ -185,6 +198,21 @@ def create_app(config: Config | None = None) -> FastAPI:
             "RELAY_COOKIE_SECURE 已关闭：会话 Cookie 不带 Secure 属性，"
             "只应在本地 http://127.0.0.1 开发时使用。生产环境必须开启。"
         )
+    if not cfg.icp_license:
+        logger.warning(
+            "RELAY_ICP_LICENSE 未配置：首页不会展示备案信息。方案 11.1 要求"
+            "展示 ICP 备案号，上线前必须在 relay.env 里补上。"
+        )
+    if not cfg.contact:
+        logger.warning(
+            "RELAY_CONTACT 未配置：首页不会展示违规内容删除联系方式。"
+            "方案 13 要求提供，上线前必须在 relay.env 里补上。"
+        )
+
+    # 静态资源挂在 /static 下，由应用自己提供——Caddyfile 只有一条
+    # reverse_proxy，没有 root 指令，所以静态文件走的是应用而不是反向代理。
+    # 这样开发与生产的资源路径完全相同，不存在"本地能加载、线上 404"。
+    app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
     app.include_router(health_router)
     app.include_router(auth_router)

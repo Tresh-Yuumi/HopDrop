@@ -63,6 +63,23 @@ LEFT JOIN devices d ON d.id = n.author_id
 
 _NOTE_SELECT = f"SELECT {NOTE_COLUMNS} {NOTE_FROM}"
 
+# 消息的排序键，升序与降序各一份。**方向不能混用**：设计稿只在"最新在前"的
+# 界面里用它，一混就会得到从中间读起的列表。
+#
+# 次级键用 **`rowid`**，不是 `id`。
+#
+# `id` 是随机 hex，所以 `(created_at, id)` 虽然也是全序（分页不会漏行、不会
+# 重复），但它在**同一秒内写入的多条消息之间给出的是随机顺序**：同一秒发的
+# 几条会按"谁的 id 大"排列，导出文件也可能从中间开始读。`rowid` 是 SQLite
+# 给 TEXT 主键表隐式分配的整数，与插入顺序同向、写入后永不变动，这才是
+# "先写的在前"。`devices` 表的列表早就在用同一套键。
+#
+# 顺带的性能事实：`idx_notes_board_time ON notes(board_id, created_at DESC)`
+# 的索引项物理顺序就是 `(board_id, created_at, rowid)`，所以这两个键正好
+# 顺着索引走，SQLite 不需要额外的排序步骤。用 `id` 反而要排一次序。
+NOTE_ORDER_ASC = "n.created_at ASC, n.rowid ASC"
+NOTE_ORDER_DESC = "n.created_at DESC, n.rowid DESC"
+
 
 def normalize_mutation_id(raw: object) -> str:
     """校验客户端提供的幂等键。
@@ -175,30 +192,29 @@ async def list_notes(
 ) -> tuple[list[dict], str | None]:
     """按时间倒序分页。返回 (行, nextCursor)。
 
-    排序键是 `(created_at DESC, id DESC)`。次级键不能省：`created_at` 只有
-    秒级精度，一条消息写入的同时另一条也在写入时，两者时间戳相同，只按
-    时间排序的话分页边界会出现重复或遗漏。
+    分页游标存的是**消息 id**（对调用方友好，也便于排查），但比较用的是它
+    的 `rowid`——理由见 `NOTE_ORDER_DESC` 上方那段。游标指向的行若已被硬
+    删除，`rowid` 就查不到，此时按无效游标处理而不是当成"从头开始"：后者
+    会让客户端把第一页再拿一遍并误以为翻页成功。
     """
     conditions = ["n.board_id = ?", "n.deleted_at IS NULL"]
     params: list[Any] = [board_id]
 
     if cursor is not None:
         anchor = await db.fetchone(
-            "SELECT id, created_at FROM notes WHERE id = ?", (cursor,)
+            "SELECT id, created_at, rowid AS seq FROM notes WHERE id = ?", (cursor,)
         )
         if anchor is None:
             raise AppError.bad_request("分页游标无效", "invalid_cursor")
-        conditions.append(
-            "(n.created_at < ? OR (n.created_at = ? AND n.id < ?))"
-        )
-        params.extend([anchor["created_at"], anchor["created_at"], anchor["id"]])
+        conditions.append("(n.created_at < ? OR (n.created_at = ? AND n.rowid < ?))")
+        params.extend([anchor["created_at"], anchor["created_at"], anchor["seq"]])
 
     params.append(limit + 1)
     rows = await db.fetchall(
         _NOTE_SELECT
         + " WHERE "
         + " AND ".join(conditions)
-        + " ORDER BY n.created_at DESC, n.id DESC LIMIT ?",
+        + f" ORDER BY {NOTE_ORDER_DESC} LIMIT ?",
         tuple(params),
     )
     has_more = len(rows) > limit
@@ -318,9 +334,16 @@ async def update_note(
             params.append(1 if pinned else 0)
         # updated_at 只在正文变化时推进。置顶不算"编辑"——如果它也推进，
         # 界面上每条被置顶的消息都会挂上"已编辑"标记。
+        #
+        # 取值用 `max(now, created_at + 1)` 而不是直接写 `now`：`edited` 是
+        # 由 `updated_at > created_at` 推出来的，两列都是秒级精度，所以发出
+        # 后一秒内改的错别字会得到两个相同的值，"这条被改过"的标记就不出现
+        # ——用户刚改完内容却发现标记没亮，比不显示标记更让人困惑。`+1` 是
+        # 补上这一秒的精度，代价是 `updatedAt` 可能比 `createdAt` 大 1，而
+        # 那恰好就是它要表达的意思。
         if content is not None:
             assignments.append("updated_at = ?")
-            params.append(now)
+            params.append(max(now, int(row["created_at"]) + 1))
 
         params.append(note_id)
         await conn.execute(

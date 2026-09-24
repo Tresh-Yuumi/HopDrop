@@ -271,14 +271,18 @@ def test_notes_of_unknown_board_is_404(owner):
 
 
 def test_owner_edits_note_and_marks_it_edited(owner, relay_env):
+    """**不等这一秒**：同一秒内创建再编辑也必须标上"已编辑"。
+
+    时间字段统一是 Unix 秒（方案 9.1），`edited` 由 `updatedAt > createdAt`
+    推出。如果编辑时把 `updated_at` 直接写成 `now`，那么"发出后立刻改错别字"
+    会得到两个相同的值，标记不出现——而"刚改完内容标记没亮"恰恰是最容易让人
+    以为没改成功的场景。所以写入路径会把它抬到 `created_at + 1`。
+
+    上一版这条用例靠 `sleep(1.1)` 跨秒来规避，那等于把待修的行为写成了前提。
+    """
     board_id = board_id_of(owner)
     note_id = post_note(owner, board_id, "原文", "m-1").json()["note"]["id"]
     before = relay_env.room_rev()
-    # 时间字段统一是 Unix 秒（方案 9.1），"编辑过"是靠 updatedAt > createdAt
-    # 推出来的。同一秒内完成的创建与编辑会得到相等的时间戳，那时界面上不会
-    # 出现"已编辑"标记——这是秒级精度的固有结果，不是判定的 bug。跨过一秒
-    # 才是真实使用中的场景，所以这里等一秒。
-    time.sleep(1.1)
 
     response = owner.patch(f"/api/notes/{note_id}", json={"content": "改过的正文"})
 

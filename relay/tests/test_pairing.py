@@ -300,16 +300,27 @@ def test_app_page_requires_pairing(relay_env):
     assert "尚未配对" in response.text
 
 
-def test_app_page_lists_devices_and_marks_current(relay_env):
+def test_app_page_shell_carries_session_context(relay_env):
+    """M5 起应用页只发一个外壳，设备列表由前端拉 /api/devices 渲染。
+
+    所以这里断言的是**外壳的契约**：容器在、当前设备名在、会话信息以 data
+    属性透出。真实设备列表的内容由 test_devices.py 在接口层覆盖——在页面
+    HTML 里找设备名会变成"测前端有没有跑起来"，那不是这一层该管的事。
+    """
     relay_env.add_room()
     with relay_env.client() as client:
         pair(relay_env, client)
         response = client.get("/app")
 
     assert response.status_code == 200
-    assert "设备列表" in response.text
-    assert "当前设备" in response.text
-    assert "rev=0" in response.text
+    assert 'id="hd-devices"' in response.text
+    assert 'id="hd-device-name"' in response.text
+    assert 'data-room-name="测试房间"' in response.text
+    assert 'data-role="owner"' in response.text
+    # 上限由服务端下发，前端不写死（方案 5.1）
+    assert 'data-note-max-bytes="65536"' in response.text
+    # 外壳里不该出现任何设备名文本：那是前端渲染的活
+    assert "<li" not in response.text.split('id="hd-devices"')[1].split("</ul>")[0]
 
 
 def test_device_name_from_user_agent(relay_env):

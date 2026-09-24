@@ -17,6 +17,7 @@ relay/                  服务端
     devices.py          设备与配对的存取
     errors.py           统一错误信封
     events.py           提交后要广播的变更（数据层与传输层的中立类型）
+    export.py           区域导出（txt / md）
     identity.py         会话解析与权限依赖
     migrations.py       顺序 SQL 迁移执行器
     notes.py            消息：幂等、编辑、软删除
@@ -24,9 +25,20 @@ relay/                  服务端
     realtime.py         WebSocket 连接表与按房间广播
     rooms.py            房间引导（含两个初始区域）与 rev 递增
     security.py         随机值与哈希
+    security_headers.py 安全响应头（与 deploy/Caddyfile 同源）
     snapshot.py         全量快照组装
     state.py            进程内运行时状态
   migrations/           NNNN_名称.sql，启动时自动应用
+  web/                  前端（无构建步骤，直接由 /static 提供）
+    app.css             唯一一份样式
+    js/                 按职责拆分，靠 <script defer> 的顺序装配
+      util.js           命名空间、DOM 构建、时间格式化
+      api.js            接口封装与错误信封
+      store.js          客户端状态与事件应用
+      render.js         可复用渲染（消息列表为 M10 悬浮窗留口子）
+      sync.js           WebSocket 与快照对齐
+      actions.js        用户操作
+      app.js            装配与事件绑定
   tests/                pytest
   relay.env.example     配置样例
 deploy/                 Caddyfile、systemd unit、备份脚本
@@ -74,6 +86,14 @@ curl -i 127.0.0.1:8080/healthz
 cd relay && ../.venv/Scripts/python.exe -m pytest -q
 ```
 
+改过前端之后再跑一次**真实浏览器冒烟测试**。它起真服务、开真浏览器，把跨设备文本闭环走一遍，并断言"JS 建出来的元素真的套上了 CSS"。默认跳过（需要浏览器，约 40 秒）：
+
+```bash
+cd relay && RELAY_UI_E2E=1 ../.venv/Scripts/python.exe -m pytest tests/test_ui_smoke.py -q
+```
+
+浏览器默认按常见位置找 Chrome/Edge，也可以用 `RELAY_CHROME` 指定可执行文件路径。
+
 本次验证通过的依赖版本：Python 3.13.14、fastapi 0.141.1、uvicorn 0.53.0、aiosqlite 0.22.1、python-multipart 0.0.32。
 
 刻意不放 lock 文件：开发机是 Windows、部署机是 Linux，`uvicorn[standard]` 的平台依赖不同（Linux 才有 uvloop），Windows 生成的 freeze 反而会误导服务器。部署时按 `requirements.txt` 的版本区间安装即可。
@@ -102,7 +122,7 @@ cd relay && ../.venv/Scripts/python.exe -m pytest -q
 | M2 | 身份、配对与长期登录：房间引导 / `/pair` / 会话 / 设备管理 / 来源校验 | 已完成 |
 | M3 | 文本区与消息 CRUD（含 `mutation_id` 幂等与 `rooms.rev`） | 已完成 |
 | M4 | WebSocket 推送与快照对齐 | 已完成 |
-| M5 | 前端页面（文本闭环可点通） | 待做 |
+| M5 | 前端页面（文本闭环可点通） | 已完成 |
 | M6 | 首次真部署（Caddy + systemd + HTTPS） | 待做 |
 | M7 | 文件上传与下载 | 待做 |
 | M8 | 配额与清理任务 | 待做 |
@@ -120,7 +140,7 @@ M1–M6 构成方案的阶段 1（文本闭环）。M9 与 M10 是纯新增模�
 - **清理任务**（M8）。`/healthz` 的 `lastCleanupAt` 现在是 `null`，代码不会假装它跑过。接入后 14.5 里"清理任务超过 3 小时未成功即 degraded"才开始生效。
 - **WebSocket**（M4）。`websocketConnections` 现在恒为 `0`。
 - **OpenAPI / Swagger UI 已关闭**。文档页要从 CDN 取资源，既被本项目的 CSP 挡住，也多一处对外接口面。接口验证靠测试。
-- **`/` 与 `/app` 目前是临时页面**（`app/api/pages.py`，M5 替换）。它们存在的唯一原因是让 M2 的"长期登录"能在浏览器里被看见，因此不使用任何内联样式或脚本（会被部署时的 CSP 拦掉），也不引入模板引擎。
+- **`/` 与 `/app` 在 M5 已替换为正式页面**（`app/api/pages.py`）。M1–M4 期间它们是临时页面，存在的唯一原因是让"长期登录"能在浏览器里被看见。正式页面同样不使用任何内联样式或脚本（会被部署时的 CSP 拦掉），也不引入模板引擎。
 
 ### M2 完成范围与已知缺口
 
@@ -170,6 +190,32 @@ M1–M6 构成方案的阶段 1（文本闭环）。M9 与 M10 是纯新增模�
 
 为了让连接限额可测，新增了三个配置项 `RELAY_WS_ROOM_LIMIT`（默认 20）、`RELAY_WS_IP_LIMIT`（默认 10）、`RELAY_WS_IDLE_TIMEOUT_SEC`（默认 60）。生产保持方案默认值。
 
+### M5 完成范围与已知缺口
+
+已完成：首页（用途说明、保留规则、主人入口、备案号可配置）与应用页外壳（顶栏 / 区域导航 / 消息流 / 输入区 / 设置抽屉），**服务端渲染、零内联样式与脚本**；`relay/web/` 下的 `app.css` 与 8 个按职责拆分的脚本，**无构建步骤**，语法限制在 Chromium 87 子集；`GET /api/boards/{id}/export?format=txt|md`；安全响应头在代码内统一下发（不依赖 Caddy 也在，且有测试比对 Caddyfile 防止两份漂移）。
+
+四条实现上的取定（第 5 条是**方案没要求、但真机跑一遍就会发现不该没有**的一处补充）：
+
+1. **消息列表渲染抽成 `render.messageList(doc, options)`，`doc` 必须显式传入。** 方案 5.4 要求悬浮窗复用同一套渲染，而悬浮窗在另一个 `Document` 上。渲染函数一旦读全局 `document`，那个页面就只能再抄一份代码——所以这个约束从 M5 第一次写渲染时就落地，而不是等 M10 回头重构。2. **导出用 `rowid` 做排序兜底，不用 `id`。** `notes.id` 是随机 TEXT 主键，同秒写入的两条消息只按 `created_at` 排序时相对顺序不确定（导出两次可能不一样），而用 `id` 排序得到的是随机顺序而不是插入顺序。`rowid` 既是插入顺序，又正好是 `idx_notes_board_time` 的物理顺序，不需要额外排序。快照与分页同步改成 `rowid`（`(created_at, rowid)` 与 `(created_at, id)` 在全序意义上等价，但前者不需要额外比较随机字符串）。
+3. **"已编辑"改为按 `updated_at > created_at` 判定，且写入时保证严格大于。** 原来同秒内的"创建 + 编辑"不会显示"已编辑"，属秒级精度的固有结果；但这一条能修——`updated_at` 取 `max(now, created_at + 1)`。置顶不推进 `updated_at`（否则每条被置顶的消息都会挂上"已编辑"）。
+4. **首页声明 `favicon.svg`。** 不声明的话浏览器会自己去请求 `/favicon.ico`，必然 404，在每个页面留一条红色控制台错误——它会把真正的错误淹掉（见下）。
+5. **记住上次停留的区域**（`localStorage`，方案未要求）。刷新后回到原处而不是跳回第一个区域。对一个"常驻在某个区域里收发文本"的工具来说，每次刷新都要重新找一遍区域，用起来是钝的。实现上必须在快照到达**之前**把它写进 `store`：快照对"激活区域"的规则是"只要它还指得着就保留不动"，晚一步设就只能被当成一次普通切换，首屏还会先闪一下第一个区域。会话失效时清掉这个偏好——那时必然要重新配对，很可能换房间，留着只会指向一个不存在的区域。
+
+**三处只在真实浏览器里才显形的问题**，都是这次真机验证抓到的，静态检查全绿：
+
+1. `util.el` 用 `setAttribute('data-' + 'boardId')` 写 `data-*`。HTML 元素上的 `setAttribute` 会把属性名小写化，落下去的是 `data-boardid`，于是 `getAttribute('data-board-id')` 永远返回 `null` —— **区域标签点了没反应**。
+2. `util.el` 用 `setAttribute('className', ...)` 写 class，落下去的是 `classname`。CSS 里那几十条规则一条都没命中，**整个界面完全没有样式**，而控制台一个错都不报。
+3. `sync.js` 的 `stopped` 初值是 `true`，而 `resync()` 开头的守卫在 `stopped` 时直接返回。启动流程是**先拉 HTTP 快照、再连 WebSocket**（快照是基线，推送只是加速器），所以首屏那次快照被静默吃掉：`store` 恒空、`rev` 恒 0，界面只能靠后续 WS 事件一条条往外长，刷新后一片空白——而连接状态照样显示"已连接"。
+
+三条的共同点是**没有任何错误信息**，因此补了两层防护：`test_webassets.py` 锁住"属性名有没有走负责转换的 API"，`tests/test_ui_smoke.py` 用真实浏览器断言"JS 建出来的元素真的套上了 CSS"。脚本里的 `stopped` 初值也加了详细注释——它看起来像个无害的初始化值。
+
+尚未接入，属后续里程碑：
+
+- **区域归档 / 恢复 / 清空访客区**（M9）：界面上有入口的位置，但动作接口没实现，所以"更多操作"里只保留导出与复制全文。
+- **搜索**（M10）、**限流**（M9）、**回收站恢复**（M9）。
+- **`files` 区仍是空数组**（M7）：快照里保留这个键就是为了让前端按最终形状写渲染逻辑。
+- **悬浮窗**（M10）：`render.messageList` 已经按"能渲染到另一个 Document"写，但浮窗页面本身还没有。
+
 ### 四处对方案的补充与取定
 
 方案 9.3 的接口表没有覆盖到实现时必须做决定的地方，这几条是取定的结果：
@@ -186,13 +232,13 @@ M1–M6 构成方案的阶段 1（文本闭环）。M9 与 M10 是纯新增模�
 - **初始区域"日常"取永久保留**（`retention = 0`）。方案只说"新建时选 30/60/永久"，没说初始区域的寿命。取永久的理由是 0.3 的红线——默认落地页静默归档会让用户直接失去写入能力。
 - **设备的 `last_seen_at` 刷新、以及所有不影响快照内容的写入，都不递增 `rooms.rev`。** `rev` 的语义是"快照内容变了"，不是"执行了几个 UPDATE"。若把设备在线时间算进去，每台设备每 60 秒就会引发一次全客户端快照重拉。
 
-### 两处已知的体验限制
+### 一处已知的体验限制
 
-- **同一秒内的"创建 + 编辑"不会显示"已编辑"。** 时间字段统一是 Unix 秒（方案 9.1），`updatedAt > createdAt` 是判定依据，秒级精度下两者会相等。这是精度的固有结果，不是判定的缺陷。
 - **归档区域是完全只读的**：不能追加、不能编辑、不能删除，只能导出和恢复。归档的语义是"封存",允许在封存件上做局部修改会让"导出内容与归档时一致"这条不成立。
 
 ## 已知环境注意事项
 
 - **国内网络**：`go.dev` 在本机不通；pip 建议走清华或阿里云镜像（`-i https://pypi.tuna.tsinghua.edu.cn/simple`）。服务器上同理。
 - **本机 PowerShell 的 stdout 不回传**，探测类命令请把结果写入文件再读。这只影响交互式排查，不影响服务本身。
+- **本机跑全量测试时给一个固定的 `--basetemp`**（例如 `--basetemp="$TEMP/hopdrop-pytest"`，放在系统临时目录下）。pytest 默认会在 `%TEMP%\pytest-of-*` 累积每次运行的目录，收尾时一次性删除几十个条目会被本机的沙箱删除守卫拦下并让整个会话以 `SystemExit` 结束。这不是项目的问题，但会让"全量测试跑不过"看起来像代码坏了。
 - `deploy/backup.sh` 依赖系统 `sqlite3` CLI，部署时要在方案 14.1 的系统初始化里装上。

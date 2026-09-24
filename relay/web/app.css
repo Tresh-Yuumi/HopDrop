@@ -1,0 +1,702 @@
+/* HopDrop 样式（方案 11.2、5.3 的前端兼容基线）。
+ *
+ * 三条自我约束，与 JS 那边一致：
+ *
+ * 1. **不用被禁的特性。** 下限是 Chromium 87，所以不能用 `:is()` / `:where()`、
+ *    `aspect-ratio`、`accent-color`、`:has()`、`dvh` / `svh`、`color-mix()`。
+ *    flex 的 `gap` 解禁了（需要 84，87 满足）。
+ * 2. **不写内联样式。** 部署后 CSP 是 `style-src 'self'`，内联 `style` 属性
+ *    会被拦掉。全部靠类名，包括"显示/隐藏"——用 `[hidden]` 而不是改 style。
+ * 3. **不依赖特殊字体**，用通用字体族栈。
+ *
+ * 主题跟随系统（`prefers-color-scheme`），不提供手动切换：这套界面只有几屏，
+ * 多一个"主题偏好"就要多一处持久化和一处不同步的可能。
+ */
+
+:root {
+  --bg: #f4f5f7;
+  --surface: #ffffff;
+  --surface-alt: #fafbfc;
+  --border: #dcdfe4;
+  --text: #1f2328;
+  --text-muted: #656d76;
+  --accent: #1f6feb;
+  --accent-text: #ffffff;
+  --danger: #b62324;
+  --danger-bg: #fdeceb;
+  --warn-bg: #fff8e5;
+  --warn-border: #e6c66b;
+  --ok: #1a7f37;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --shadow: 0 1px 2px rgba(31, 35, 40, 0.08);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface-alt: #1c2129;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-muted: #9198a1;
+    --accent: #4493f8;
+    --accent-text: #0d1117;
+    --danger: #f85149;
+    --danger-bg: #2d1417;
+    --warn-bg: #2b2413;
+    --warn-border: #6b5a20;
+    --ok: #3fb950;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans CJK SC",
+    "Source Han Sans SC", "Microsoft YaHei", "PingFang SC", Roboto, Helvetica, Arial,
+    sans-serif;
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-text-size-adjust: 100%;
+}
+
+a {
+  color: var(--accent);
+}
+
+code {
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+/* 屏幕阅读器可见、视觉不可见。用 clip 而不是 display:none——后者会让
+ * 辅助技术也读不到。 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------------------------------------------------------------- 按钮 */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.4rem 0.7rem;
+  font-size: 0.9rem;
+  font-family: inherit;
+  line-height: 1.2;
+  cursor: pointer;
+  text-decoration: none;
+  min-height: 32px;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--surface-alt);
+}
+
+.btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+
+.btn--primary:hover:not(:disabled) {
+  background: var(--accent);
+  opacity: 0.9;
+}
+
+.btn--ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-muted);
+}
+
+.btn--ghost:hover:not(:disabled) {
+  background: var(--surface-alt);
+  color: var(--text);
+}
+
+.btn--danger {
+  color: var(--danger);
+  border-color: var(--border);
+}
+
+.btn--icon {
+  padding: 0.4rem 0.55rem;
+}
+
+.btn--tiny {
+  min-height: 26px;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.82rem;
+}
+
+select.btn {
+  padding-right: 1.6rem;
+}
+
+/* ---------------------------------------------------------------- 首页 */
+
+.page {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 2rem 1.25rem 3rem;
+}
+
+.page__title {
+  margin: 0 0 0.4rem;
+  font-size: 2rem;
+  letter-spacing: -0.01em;
+}
+
+.page__lead {
+  margin: 0 0 1.5rem;
+  color: var(--text-muted);
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 1rem 1.15rem;
+  margin-bottom: 1rem;
+  box-shadow: var(--shadow);
+}
+
+.card h2 {
+  margin: 0 0 0.6rem;
+  font-size: 1rem;
+}
+
+.card p {
+  margin: 0.4rem 0;
+}
+
+.rules {
+  margin: 0;
+  padding-left: 1.2rem;
+}
+
+.rules li {
+  margin: 0.3rem 0;
+}
+
+/* ---------------------------------------------------------------- 骨架 */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.topbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.6rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.topbar__room {
+  flex: 1 1 auto;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 连接状态（方案 11.3）。三态用 data-state 表达，文案由脚本写。 */
+.conn {
+  flex: 0 0 auto;
+  font-size: 0.82rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.conn[data-state="online"] {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.conn[data-state="offline"] {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.layout {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* 窄屏：区域列表横滑（方案 11.2）。 */
+.boards {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: row;
+  gap: 0.3rem;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.45rem 0.6rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  -webkit-overflow-scrolling: touch;
+}
+
+.boards__item {
+  flex: 0 0 auto;
+  max-width: 11rem;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  padding: 0.25rem 0.7rem;
+  font-family: inherit;
+  font-size: 0.88rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.boards__item[aria-current="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.boards__item--guest[aria-current="false"] {
+  border-style: dashed;
+}
+
+.boards__count {
+  color: inherit;
+  opacity: 0.7;
+  font-size: 0.8em;
+}
+
+.panel {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* 宽屏：左侧区域列表、右侧消息流（方案 11.2）。 */
+@media (min-width: 760px) {
+  .layout {
+    flex-direction: row;
+  }
+
+  .boards {
+    flex-direction: column;
+    gap: 0.25rem;
+    width: 13rem;
+    overflow-x: hidden;
+    overflow-y: auto;
+    border-bottom: 0;
+    border-right: 1px solid var(--border);
+    padding: 0.6rem 0.5rem;
+  }
+
+  .boards__item {
+    max-width: none;
+    width: 100%;
+    text-align: left;
+    border-radius: var(--radius);
+  }
+}
+
+/* ---------------------------------------------------------------- 提示条 */
+
+.notices {
+  flex: 0 0 auto;
+}
+
+.notice {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  background: var(--warn-bg);
+  border-bottom: 1px solid var(--warn-border);
+  font-size: 0.85rem;
+}
+
+.notice--dev {
+  color: var(--danger);
+  background: var(--danger-bg);
+  border-bottom-color: var(--danger);
+}
+
+.boardbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.boardbar__main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.boardbar__name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.boardbar__meta {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+/* ---------------------------------------------------------------- 消息 */
+
+.notes {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 0.6rem 0.75rem 1rem;
+  -webkit-overflow-scrolling: touch;
+}
+
+.notes__empty {
+  color: var(--text-muted);
+  text-align: center;
+  padding: 2rem 1rem;
+}
+
+.note {
+  position: relative;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 0.55rem 0.7rem;
+  margin-bottom: 0.55rem;
+  box-shadow: var(--shadow);
+}
+
+.note--pinned {
+  border-color: var(--accent);
+}
+
+.note__meta {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-bottom: 0.25rem;
+}
+
+.note__author {
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.note__time {
+  flex: 0 0 auto;
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.flag {
+  flex: 0 0 auto;
+  font-size: 0.75rem;
+  padding: 0 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.flag--accent {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* 正文按纯文本渲染（方案 4.1）：保留换行与空格，长串不断行。
+ * `word-break: break-word` 是为了让超长 URL 不把卡片撑破。 */
+.note__body {
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+.note__body a {
+  overflow-wrap: anywhere;
+}
+
+.note__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.4rem;
+}
+
+.note__edit {
+  width: 100%;
+  min-height: 5rem;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: 1.55;
+  color: var(--text);
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.45rem 0.55rem;
+  resize: vertical;
+}
+
+.more {
+  padding: 0 0.75rem 0.6rem;
+  text-align: center;
+}
+
+/* ---------------------------------------------------------------- 输入区 */
+
+.composer {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  padding: 0.5rem 0.75rem 0.6rem;
+}
+
+.composer__input {
+  display: block;
+  width: 100%;
+  min-height: 3.6rem;
+  max-height: 40vh;
+  resize: vertical;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: 1.55;
+  color: var(--text);
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.6rem;
+}
+
+.composer__bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+}
+
+.composer__status {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer__status--error {
+  color: var(--danger);
+}
+
+.composer__status--ok {
+  color: var(--ok);
+}
+
+.composer__count {
+  flex: 0 0 auto;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+/* 输入框被"已过期"这类状态禁用时明确变灰。 */
+.composer--disabled .composer__input {
+  opacity: 0.6;
+}
+
+/* ---------------------------------------------------------------- 设置抽屉 */
+
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(22rem, 92vw);
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  box-shadow: -4px 0 16px rgba(0, 0, 0, 0.15);
+  z-index: 20;
+}
+
+.drawer__head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.drawer__head h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.drawer__body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 0.75rem;
+}
+
+.group {
+  margin-bottom: 1.2rem;
+}
+
+.group h3 {
+  margin: 0 0 0.4rem;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.group p {
+  margin: 0.3rem 0;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  cursor: pointer;
+}
+
+.check input {
+  margin-top: 0.25rem;
+}
+
+.devices {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.devices li {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.45rem 0.55rem;
+  margin-bottom: 0.4rem;
+}
+
+.devices__line {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+}
+
+.devices__name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.devices__time {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.scrim {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 10;
+}
+
+/* ---------------------------------------------------------------- 浮层提示 */
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 5.2rem;
+  transform: translateX(-50%);
+  max-width: 88vw;
+  background: var(--text);
+  color: var(--bg);
+  border-radius: 999px;
+  padding: 0.4rem 0.9rem;
+  font-size: 0.86rem;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+  z-index: 30;
+}
+
+.toast--error {
+  background: var(--danger);
+  color: #ffffff;
+}
+
+[hidden] {
+  display: none !important;
+}

@@ -29,6 +29,7 @@ from ..boards import create_board as create_board_row
 from ..config import Config
 from ..db import Database
 from ..errors import AppError
+from ..export import build_board_export
 from ..identity import AuthContext, current_owner, current_session
 from ..notes import (
     create_note,
@@ -216,3 +217,40 @@ async def post_board_note(
     if not created:
         response.status_code = 200
     return {"note": serialize_note(row)}
+
+
+@router.get("/boards/{board_id}/export")
+async def export_board(
+    board_id: str,
+    request: Request,
+    context: Annotated[AuthContext, Depends(current_session)],
+    fmt: Annotated[str, Query(alias="format")] = "txt",
+) -> Response:
+    """按需导出区域为 `.txt` / `.md`（方案 4.1、9.3）。
+
+    三点实现上的说明：
+
+    一、**这里返回的是文件而不是 JSON 信封**。方案 9.1 的错误信封对成功响应
+    不适用——一个要被浏览器直接下载的文件不该套一层 `{"ok": true}`。错误路径
+    仍然走信封：`build_board_export` 抛出的 `AppError` 由全局处理器转成 JSON，
+    状态码与错误码与其他接口一致。
+
+    二、**`format` 的取值用 400 拒绝，不猜**。传 `pdf` 时默认回落到 txt 会让
+    调用方以为自己拿到了 PDF。
+
+    三、**不用 `FileResponse`/临时文件**。导出是现算的字符串，落一次临时文件
+    只会引入"临时目录在哪、谁清理"这两个新问题（方案 7.1 的磁盘预算很紧）。
+    """
+    db: Database = request.app.state.db
+    result = await build_board_export(
+        db,
+        room_id=context.room_id,
+        board_id=board_id,
+        role=context.role,
+        fmt=fmt,
+    )
+    return Response(
+        content=result.content,
+        media_type=result.media_type,
+        headers={"Content-Disposition": result.content_disposition()},
+    )

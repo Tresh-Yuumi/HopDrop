@@ -10,6 +10,11 @@
 	encode zstd gzip
 
 	header {
+		# ⚠️ 这一组与 relay/app/security_headers.py 的 SECURITY_HEADERS 必须
+		# 逐字一致。应用中间件也下一份（本地开发没有 Caddy，那时只有应用这
+		# 一份在起作用），两处都留是为了应用挂掉返回 502 时头仍在。
+		# tests/test_security_headers.py 会解析本文件逐条比对，改一处不改
+		# 另一处会让测试失败——不要靠注释维持一致。
 		Referrer-Policy "no-referrer"
 		X-Content-Type-Options "nosniff"
 		X-Frame-Options "DENY"

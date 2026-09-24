@@ -209,7 +209,12 @@ def test_snapshot_does_not_leak_other_rooms(relay_env: RelayEnv) -> None:
 
 
 def test_snapshot_notes_are_ordered_newest_first(relay_env: RelayEnv) -> None:
-    """同一秒内写入的多条消息也要有稳定顺序（次级键是 id）。"""
+    """同一秒内写入的多条消息也要有稳定顺序（次级键是 rowid，即写入顺序）。
+
+    断言方式是"与写入顺序**相反**"，而不是"id 降序"：`id` 是随机 hex，按它
+    排出来的顺序与写入顺序无关，用它做断言等于只验了"顺序稳定"而没验"顺序
+    正确"。写入顺序才是这里唯一有意义的基准。
+    """
     relay_env.add_room()
     with relay_env.paired_client() as client:
         board = _create_board(client, "工作")
@@ -217,8 +222,9 @@ def test_snapshot_notes_are_ordered_newest_first(relay_env: RelayEnv) -> None:
         body = client.get("/api/snapshot").json()
 
     from_snapshot = next(b for b in body["boards"] if b["id"] == board["id"])
-    # 断言的是"排序键降序"而不是"id 降序"：created_at 只有秒级精度，一旦
-    # 这六条跨了秒，两者就不等价了。排序键就是 (createdAt, id)。
-    keys = [(n["createdAt"], n["id"]) for n in from_snapshot["notes"]]
-    assert keys == sorted(keys, reverse=True)
+    ids = [n["id"] for n in from_snapshot["notes"]]
+    assert ids == list(reversed([note["id"] for note in created]))
     assert {n["id"] for n in from_snapshot["notes"]} == {note["id"] for note in created}
+    # created_at 降序这条不变
+    stamps = [n["createdAt"] for n in from_snapshot["notes"]]
+    assert stamps == sorted(stamps, reverse=True)

@@ -32,7 +32,7 @@ from .boards import BOARD_LIMIT_PER_ROOM, list_boards, serialize_board
 from .config import Config
 from .db import Database
 from .identity import AuthContext
-from .notes import NOTE_COLUMNS, NOTE_FROM, serialize_note
+from .notes import NOTE_COLUMNS, NOTE_FROM, NOTE_ORDER_DESC, serialize_note
 
 
 async def load_recent_notes(
@@ -62,7 +62,7 @@ async def load_recent_notes(
         FROM (
             SELECT id,
                    ROW_NUMBER() OVER (
-                     PARTITION BY board_id ORDER BY created_at DESC, id DESC
+                     PARTITION BY board_id ORDER BY created_at DESC, rowid DESC
                    ) AS rn
             FROM notes
             WHERE board_id IN ({placeholders}) AND deleted_at IS NULL
@@ -72,7 +72,7 @@ async def load_recent_notes(
     SELECT {NOTE_COLUMNS}
     {NOTE_FROM}
     JOIN keep ON keep.id = n.id
-    ORDER BY n.board_id ASC, n.created_at DESC, n.id DESC
+    ORDER BY n.board_id ASC, {NOTE_ORDER_DESC}
     """
     rows = await db.fetchall(sql, (*board_ids, limit), conn=conn)
 

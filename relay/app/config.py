@@ -112,6 +112,12 @@ class Config:
     ws_room_limit: int
     ws_ip_limit: int
     ws_idle_timeout_sec: int
+    # 首页展示的 ICP 备案号与违规内容举报联系方式。空字符串表示未配置——
+    # 此时首页不渲染对应那一段，而不是渲染一个空占位。方案 11.1 与第 13 节
+    # 都要求展示这两项，但第 17 节的值仍是"待填"，所以必须允许为空，并且在
+    # 启动日志里明确提示。
+    icp_license: str
+    contact: str
     # 原始值，仅用于日志展示
     raw_disk_reserve_gb: float = field(default=3.0, repr=False)
     raw_data_quota_gb: float = field(default=3.0, repr=False)
@@ -158,6 +164,8 @@ class Config:
             "ws_room_limit": self.ws_room_limit,
             "ws_ip_limit": self.ws_ip_limit,
             "ws_idle_timeout_sec": self.ws_idle_timeout_sec,
+            "icp_license": self.icp_license,
+            "contact": self.contact,
         }
 
 
@@ -219,6 +227,11 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         # 方案 10：客户端每 25 秒 ping，服务端 60 秒未收到活动即关闭。
         # 下限放到 1 秒同样是为了可测。
         ws_idle_timeout_sec=_int(env, "RELAY_WS_IDLE_TIMEOUT_SEC", 60, minimum=1, maximum=600),
+        # 形如「沪ICP备12345678号-1」。默认空：宁可首页少一行，也不要拿一个
+        # 编造的备案号上去——备案号是监管信息，写错比不写严重。
+        icp_license=_raw(env, "RELAY_ICP_LICENSE") or "",
+        # 方案 13 要求首页给出违规内容的删除联系方式。默认空，理由同上。
+        contact=_raw(env, "RELAY_CONTACT") or "",
         raw_disk_reserve_gb=disk_reserve_gb,
         raw_data_quota_gb=data_quota_gb,
         raw_room_file_quota_gb=room_file_quota_gb,
