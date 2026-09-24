@@ -17,6 +17,10 @@ User=relay
 Group=relay
 WorkingDirectory=/opt/relay
 EnvironmentFile=/etc/relay/relay.env
+# ProtectSystem=strict 让 /opt/relay 只读，Python 写不了 __pycache__。
+# 不加这条不会报错——Python 会静默跳过缓存写入，每次启动重新编译一遍源码；
+# 加了省掉这次无用功，也让"为什么线上没有 .pyc"不再是个需要查的疑问。
+Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/relay/venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8080 --no-access-log
 Restart=on-failure
 RestartSec=3

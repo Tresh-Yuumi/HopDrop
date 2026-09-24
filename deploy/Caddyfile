@@ -1,12 +1,21 @@
 # HopDrop 反向代理配置（方案 14.3）
 #
-# 用法：把 {$RELAY_DOMAIN} 通过环境变量传给 Caddy，或直接替换成实际域名。
-# 域名与备案信息见方案第 17 节。
+# 域名从环境变量 RELAY_DOMAIN 读，由 deploy/install.sh 通过 systemd drop-in
+# 把 /etc/relay/relay.env 注入 Caddy 进程。**本文件因此不含任何部署专属信息**，
+# 可以随每次发布被安全地整体覆盖——一旦把域名写死在这里，就再也不能自动更新它了。
 #
 # 证书由 Caddy 自动申请与续期，前置条件是 80 / 443 可从公网访问、
 # 且域名解析已指向本机。备案未完成时 80 端口会被拦截，证书签不下来。
-
-{$RELAY_DOMAIN:relay.example.com} {
+#
+# 站点地址写成 {$RELAY_DOMAIN::80}：默认值是 :80，即域名没配时降级为纯 HTTP。
+# 注意这是 {$VAR:默认值} 语法，而默认值本身以冒号开头，所以看起来像两个冒号
+# ——不是笔误。给一个像 relay.example.com 这样的占位默认值的后果是：Caddy 会
+# 拿它去反复申请证书，签不下来就重试，日志被刷满，而真正的问题（域名没配）
+# 一条都不提。
+#
+# 纯 HTTP 模式下带 Secure 的会话 Cookie 会被浏览器丢弃，也就是"能打开页面但
+# 配不上对"。这个模式只用于部署验收，生产必须配 RELAY_DOMAIN。
+{$RELAY_DOMAIN::80} {
 	encode zstd gzip
 
 	header {

@@ -18,6 +18,9 @@ data/
 .env
 relay.env
 
+# 发布包（deploy/release.sh 产出，含 tar.gz 与 sha256）
+dist/
+
 # 编辑器
 .idea/
 .vscode/

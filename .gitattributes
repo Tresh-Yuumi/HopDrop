@@ -1,0 +1,10 @@
+# 换行符策略：仓库里一律 LF，检出一律 LF。
+#
+# 本机的 core.autocrlf=true 会在**检出时**把 LF 转成 CRLF，而 deploy/ 下的
+# 脚本与 systemd / Caddy 配置是要在 Linux 上执行的：CRLF 的 shebang 会让
+# bash 报 `bad interpreter: No such file or directory`，报错完全指不到真正的
+# 原因。本机有 Git Bash 兜着，所以这类问题只在真实服务器上暴露。
+#
+# 把它写进仓库而不是依赖每个人的 git 配置：`core.autocrlf` 是本地设置，
+# 换一台机器重新 clone 就没了，而"部署脚本能不能跑"不该取决于这个。
+* text=auto eol=lf

@@ -1,0 +1,26 @@
+[Unit]
+Description=HopDrop relay health check
+Documentation=file:/opt/relay/deploy/RUNBOOK.md
+After=relay.service
+# 不写 Requires=relay.service：relay 挂了正是本检查要发现的事情，
+# 写成 Requires 会让检查跟着一起被跳过。
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hopdrop-healthcheck
+
+# 退出码即健康状态：0 健康 / 1 不可达 / 2 degraded。
+# 三种都不是"这个单元坏了"，所以都算成功——否则 timer 每分钟会把系统
+# 标成 failed，运维真正要看的 journal 反而被淹没。
+SuccessExitStatus=0 1 2
+
+# 默认不自动重启 relay。要打开的话把下面这行的注释去掉：
+# --restart-after=3 只在连续 3 次"不可达"时重启，degraded 不重启。
+# 理由见 hopdrop-healthcheck.sh 顶部。
+# ExecStart=/usr/local/bin/hopdrop-healthcheck --restart-after=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/relay

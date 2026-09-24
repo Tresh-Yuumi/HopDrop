@@ -41,7 +41,15 @@ relay/                  服务端
       app.js            装配与事件绑定
   tests/                pytest
   relay.env.example     配置样例
-deploy/                 Caddyfile、systemd unit、备份脚本
+deploy/                 部署件（用法见 deploy/RUNBOOK.md）
+  RUNBOOK.md            部署手册：首次部署、发布、回滚、验收、故障处置
+  install.sh            服务器初始化（幂等；--check / --prefix 演练）
+  release.sh            开发机侧发布：打包 + 校验 + 推送 + 调 install.sh
+  rollback.sh           服务器侧回滚：代码与数据库
+  Caddyfile             反向代理（域名走 RELAY_DOMAIN 环境变量）
+  relay.service         systemd unit
+  backup.sh             每日数据库备份
+  hopdrop-healthcheck.sh / .service / .timer   每分钟健康检查
 ```
 
 ## 本地跑起来
@@ -102,6 +110,24 @@ cd relay && RELAY_UI_E2E=1 ../.venv/Scripts/python.exe -m pytest tests/test_ui_s
 
 全部参数来自 `RELAY_*` 环境变量，没有配置文件。逐项说明见 `relay/relay.env.example`。代码里的默认值面向本地开发；生产由 `/etc/relay/relay.env` 覆盖。
 
+## 部署
+
+看 **`deploy/RUNBOOK.md`**：首次部署的前置条件、验收清单（对照方案第 18 节的完成定义）、日常发布、回滚、备份恢复演练、故障处置。
+
+一句话版本：
+
+```bash
+bash deploy/release.sh --host root@<服务器> [--domain <域名>]
+```
+
+没有 Linux 机器时也能验证部署脚本本身——`install.sh` 提供了 `--prefix` 与 `--no-system`：
+
+```bash
+bash deploy/install.sh --prefix /tmp/hopdrop-drill
+```
+
+它跑的是真实的文件生成、权限与幂等逻辑，只把 `apt` / `ufw` / `systemctl` / `useradd` 这些需要真系统的步骤让开。`tests/test_deploy.py` 把这条演练固化成测试。
+
 ## 不可妥协的约束
 
 这些不是风格偏好，改了会坏：
@@ -123,7 +149,7 @@ cd relay && RELAY_UI_E2E=1 ../.venv/Scripts/python.exe -m pytest tests/test_ui_s
 | M3 | 文本区与消息 CRUD（含 `mutation_id` 幂等与 `rooms.rev`） | 已完成 |
 | M4 | WebSocket 推送与快照对齐 | 已完成 |
 | M5 | 前端页面（文本闭环可点通） | 已完成 |
-| M6 | 首次真部署（Caddy + systemd + HTTPS） | 待做 |
+| M6 | 首次真部署（Caddy + systemd + HTTPS） | 已完成（部署件与演练完成；真机执行待域名） |
 | M7 | 文件上传与下载 | 待做 |
 | M8 | 配额与清理任务 | 待做 |
 | M9 | 访客与生命周期（可延后，不返工） | 待做 |
@@ -215,6 +241,29 @@ M1–M6 构成方案的阶段 1（文本闭环）。M9 与 M10 是纯新增模�
 - **搜索**（M10）、**限流**（M9）、**回收站恢复**（M9）。
 - **`files` 区仍是空数组**（M7）：快照里保留这个键就是为了让前端按最终形状写渲染逻辑。
 - **悬浮窗**（M10）：`render.messageList` 已经按"能渲染到另一个 Document"写，但浮窗页面本身还没有。
+
+### M6 完成范围与已知缺口
+
+已完成：`deploy/install.sh`（幂等，含 `--check` 与 `--prefix/--no-system` 本机演练）、`deploy/release.sh`（打包 → 远端校验 sha256 → 备份旧代码 → 铺新代码 → 调 install.sh）、`deploy/rollback.sh`（代码与数据库，数据库回滚会清 WAL）、`hopdrop-healthcheck` 与每分钟的 systemd timer、`deploy/RUNBOOK.md`、`relay/tests/test_deploy.py`（41 项）。
+
+**部署动作本身还没在真机上执行过**——缺域名与备案号，见 RUNBOOK 第一节。部署件、演练与验收清单都已就绪，拿到域名即可执行。
+
+七条实现上的取定：
+
+1. **代码用 `tar | ssh` 推，不在服务器上配 git。** 仓库是私有的，服务器拉代码要再配一份部署密钥与仓库权限；这是一个单人项目、一台机器，把 `relay/` 的内容铺过去就够了。代价是服务器上没有提交历史，靠包里的 `MANIFEST.txt` 记版本。
+2. **目录布局是"铺平"的**：`/opt/relay/app/main.py`，而不是 `/opt/relay/relay/app/`。这是被 `relay.service` 里的 `WorkingDirectory=/opt/relay` + `-m uvicorn app.main:app` 决定的。`install.sh` 的预检会直接拦住铺错层级的情况——那种错误的报错是 `ModuleNotFoundError: app`，离原因很远。
+3. **Caddyfile 里不含任何部署专属信息**，域名走 `RELAY_DOMAIN`，由 systemd drop-in 把 `relay.env` 注进 Caddy 进程。这样 Caddyfile 可以随每次发布被整体覆盖；一旦写死域名，"自动更新它"就不成立了。
+4. **域名没配时 Caddy 降级到 `:80` 纯 HTTP**（站点地址写成 `{$RELAY_DOMAIN::80}`）。给一个像 `relay.example.com` 这样的占位默认值，后果是 Caddy 拿着它反复申请证书、日志刷满，而"域名没配"这条真正的原因一条都不提。
+5. **`install.sh` 绝不覆盖已存在的 `/etc/relay/relay.env`**，只报告模板里新增的键。里面有部署者填的域名与备案号，覆盖一次就没了。这条有测试真跑两遍锁住。
+6. **健康检查默认不自动重启服务。** degraded 的原因里，磁盘余量不足、超配额、清理任务失败这三类，重启一次都修不好，只会把现场清掉。真正需要重启的是"进程活着但不响应"，要显式打开 `--restart-after`。
+7. **`ufw` 只放行、不启用。** 同机有共存服务，`ufw enable` 会按默认策略挡掉别人的端口，这个决定留给运维。
+
+另外两点：`relay.service` 加了 `PYTHONDONTWRITEBYTECODE=1`（`ProtectSystem=strict` 下写不了 `__pycache__`，不加也不会报错，只是每次启动白编译一遍）；健康检查脚本用 `curl --fail-with-body` 而不是 `-f`——`-f` 在 503 时**不给响应体**，而 degraded 的原因恰好就在响应体里，这条是写测试时才发现的。
+
+尚未接入，属后续里程碑：
+
+- **清理任务**（M8）。`/healthz` 的 `lastCleanupAt` 仍是 `null`，所以 14.5 里"清理任务超过 3 小时未成功即 degraded"这条还没有触发源。
+- **限流**（M9）、**文件上传**（M7）。
 
 ### 四处对方案的补充与取定
 

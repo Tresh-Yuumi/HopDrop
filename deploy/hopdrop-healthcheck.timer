@@ -1,0 +1,14 @@
+[Unit]
+Description=Run HopDrop health check every minute
+
+[Timer]
+# 开机 2 分钟后再开始：给 relay 留出迁移与首帧的时间。
+OnBootSec=2min
+OnUnitActiveSec=1min
+# 允许 systemd 在窗口内合并唤醒，省一点电，1 分钟的精度损失无所谓。
+AccuracySec=10s
+# Persistent 对本检查没有意义（历史状态不补跑），显式关掉。
+Persistent=false
+
+[Install]
+WantedBy=timers.target
