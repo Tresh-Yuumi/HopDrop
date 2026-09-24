@@ -92,7 +92,7 @@ cd relay && ../.venv/Scripts/python.exe -m pytest -q
 cd relay && RELAY_UI_E2E=1 ../.venv/Scripts/python.exe -m pytest tests/test_ui_smoke.py -q
 ```
 
-浏览器默认按常见位置找 Chrome/Edge，也可以用 `RELAY_CHROME` 指定可执行文件路径。
+浏览器默认按常见位置找 Chrome/Edge，也可以用 `RELAY_CHROME` 指定可执行文件路径；加 `RELAY_UI_SCREENSHOT=<路径>` 可以把最后一屏存成 PNG（排样式问题时有用）。
 
 本次验证通过的依赖版本：Python 3.13.14、fastapi 0.141.1、uvicorn 0.53.0、aiosqlite 0.22.1、python-multipart 0.0.32。
 

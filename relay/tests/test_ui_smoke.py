@@ -675,6 +675,16 @@ async def _drive(base: str, secret: str, work_dir: Path) -> list[Check]:
         checks.append(
             ("全程无控制台异常或错误", not page.console_errors, " | ".join(page.console_errors[:4]))
         )
+
+        # ---- 可选截图：设了 RELAY_UI_SCREENSHOT=<路径> 就把最后一屏存下来。
+        # 断言能说明"哪一条断了"，但说明不了"界面长什么样"——排样式问题时
+        # 一张图胜过十条断言。
+        shot = os.environ.get("RELAY_UI_SCREENSHOT")
+        if shot:
+            import base64
+
+            result = await page.call("Page.captureScreenshot", {"format": "png"})
+            Path(shot).write_bytes(base64.b64decode(result["data"]))
         return checks
     finally:
         browser.terminate()
