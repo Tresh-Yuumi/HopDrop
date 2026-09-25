@@ -200,9 +200,16 @@ class ConnectionManager:
 def client_ip(*, forwarded_for: str | None, peer_host: str | None) -> str:
     """判定连接来源 IP，用于方案 10 的单 IP 连接上限。
 
-    **前提是 uvicorn 只监听回环地址、唯一入口是 Caddy**（方案 14.3 的部署
-    形态，`RELAY_ADDR` 默认就是 `127.0.0.1:8080`）。在这个前提下
-    `X-Forwarded-For` 由 Caddy 覆写，客户端伪造不了。
+    **前提是 uvicorn 只监听回环地址、且唯一入口是反向代理**（方案 14.3 的
+    部署形态，`RELAY_ADDR` 默认就是 `127.0.0.1:8080`）。
+
+    这个前提里有一半很容易被忽略：**反向代理必须是"覆盖式"写这个头。**
+    本函数取的是 `X-Forwarded-For` 的**第一个**值，只有当代理用对端地址覆盖
+    掉整个头时，它才等于真实来源 IP。Caddy 默认就是覆盖，所以按 Caddy 部署
+    时这一点不需要额外说明；而 nginx 的惯用写法
+    `$proxy_add_x_forwarded_for` 是**追加**，会把客户端自己带来的伪造值排在
+    最前面，任何人就都能伪造来源 IP、绕过限额。因此 `deploy/install.sh`
+    生成的站点里写的是 `$remote_addr`，并有一条测试锁住它不被改回追加式。
 
     如果哪天把 uvicorn 直接暴露到公网，这个头就变成客户端可控的，IP 限额
     随之失效——但失效的只是限额，不是权限：连接仍然要过会话校验。风险不对等，

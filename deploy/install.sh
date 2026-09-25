@@ -10,12 +10,31 @@
 # 已存在的 /etc/relay/relay.env **一律不覆盖**——里面有部署者填的域名与备案
 # 信息，覆盖一次就可能把主人链接和备案号一起抹掉。脚本只报告模板里新增的键。
 #
+# ---------------------------------------------------------------------------
+# 同机共存是这个脚本的第一设计约束（方案 17 节：目标机上还跑着别的服务）。
+# 由此派生出四条硬规则，改这个脚本之前先读一遍：
+#
+#   1. **不抢端口。** 80/443 通常已经由既有反代（nginx / Caddy）持有，HopDrop
+#      只是它的一个 server 块，上游指向 127.0.0.1:8080。永远不 restart 反代，
+#      只在 `nginx -t` 通过之后 reload——reload 平滑，既有连接不断；restart
+#      会瞬断这台机器上的所有站点。
+#   2. **校验失败必须回滚。** 往一个跑着多个站点的 nginx 里塞一份语法错误的
+#      配置，后果是"reload 的那一刻所有站点一起挂"。所以流程固化成
+#      写文件 → `nginx -t` → 通过才 reload；不通过就把文件恢复原样。
+#   3. **不装网络相关的"顺手包"。** ufw 装了就有人会 enable，而 enable 会按
+#      默认策略 deny incoming，把共存服务的端口一起挡掉；fail2ban 装上就会
+#      启用 sshd jail，可能把部署者自己 ban 掉。两者都不在依赖列表里。
+#   4. **不改系统级设置。** 时区、swap、内核参数一律只报告不修改。
+#
 # 用法：
-#   sudo bash deploy/install.sh             # 初始化或修复
-#   sudo bash deploy/install.sh --check     # 只报告差异，不做任何改动
+#   sudo bash deploy/install.sh                 # 初始化或修复（自动探测反代）
+#   sudo bash deploy/install.sh --check         # 只报告差异，不做任何改动
+#   sudo bash deploy/install.sh --proxy=caddy   # 目标机用 Caddy 而非 nginx
+#   sudo bash deploy/install.sh --proxy=none    # 不配反代，只在回环提供服务
 #   bash deploy/install.sh --no-system --prefix /tmp/drill
-#                                           # 本机演练：跳过 apt/ufw/systemd/
-#                                           #   useradd，把绝对路径挂到 --prefix 下
+#                                               # 本机演练：跳过 apt / 系统服务
+#                                               #   / useradd，把绝对路径挂到
+#                                               #   --prefix 下
 #
 # 演练模式是为"在没有 Linux 机器的情况下验证这个脚本本身"而存在的。它跑的是
 # 真实的文件生成、权限与幂等逻辑，只把需要真系统的部分让开。
@@ -28,6 +47,10 @@ set -euo pipefail
 PREFIX="/"
 SYS=1
 CHECK=0
+# auto | nginx | caddy | none
+PROXY_MODE="auto"
+# step_reverse_proxy 探测后的实际取值，供后续步骤（防火墙、汇总）判断。
+RESOLVED_PROXY=""
 
 APP_USER="relay"
 APP_GROUP="relay"
@@ -50,14 +73,18 @@ HEALTH_BIN=""
 CRON_FILE=""
 CADDYFILE=""
 CADDY_DROPIN=""
+NGINX_SITE=""
+NGINX_SITE_ENABLED=""
 
 usage() {
 	cat <<'EOF'
 用法：sudo bash deploy/install.sh [选项]
 
   --check             只报告将要做的改动，不写任何文件、不动任何服务
+  --proxy=MODE        反向代理模式：auto（默认，自动探测 80/443 上的进程）
+                      | nginx | caddy | none（不配反代，仅回环可用）
   --prefix DIR        把 /opt/relay、/var/lib/relay 等绝对路径挂到 DIR 下（演练用）
-  --no-system         跳过 apt / ufw / systemctl / useradd 等需要真实系统与 root 的步骤
+  --no-system         跳过 apt / systemctl / useradd 等需要真实系统与 root 的步骤
   -h, --help          显示本帮助
 
 环境变量：
@@ -81,6 +108,12 @@ parse_args() {
 		case "$1" in
 		--check) CHECK=1 ;;
 		--no-system) SYS=0 ;;
+		--proxy)
+			shift
+			[ $# -gt 0 ] || die "--proxy 需要一个取值"
+			PROXY_MODE="$1"
+			;;
+		--proxy=*) PROXY_MODE="${1#--proxy=}" ;;
 		--prefix)
 			shift
 			[ $# -gt 0 ] || die "--prefix 需要一个目录参数"
@@ -95,6 +128,11 @@ parse_args() {
 		esac
 		shift
 	done
+
+	case "$PROXY_MODE" in
+	auto | nginx | caddy | none) ;;
+	*) die "--proxy 只接受 auto / nginx / caddy / none，收到：$PROXY_MODE" ;;
+	esac
 
 	if [ "$PREFIX" != "/" ]; then
 		SYS=0
@@ -117,6 +155,11 @@ setup_paths() {
 	CRON_FILE="$p/etc/cron.d/hopdrop-backup"
 	CADDYFILE="$p/etc/caddy/Caddyfile"
 	CADDY_DROPIN="$p/etc/systemd/system/caddy.service.d/10-hopdrop.conf"
+	# 站点文件名不带 .conf 后缀，与这台机器上既有的 fortranslate / minitalk /
+	# phound 保持一致——只在 sites-enabled/* 的 include 范围内，两边都行，
+	# 但命名风格统一之后，ls 一下就知道哪些站点是谁的。
+	NGINX_SITE="$p/etc/nginx/sites-available/hopdrop"
+	NGINX_SITE_ENABLED="$p/etc/nginx/sites-enabled/hopdrop"
 }
 
 # ---------------------------------------------------------------- 基础动作
@@ -134,11 +177,19 @@ sysrun() {
 	"$@"
 }
 
+# 丢弃临时文件。吞掉错误：删不掉一个临时文件不该让部署停在这里。
+# 本机演练环境的删除守卫会拦下部分路径（报 SAFE_DELETE_*），而真实 Linux 上
+# `rm -f` 基本不会失败——但"因为删不掉临时文件就中止部署"的代价太高，
+# 所以这里一律把失败吞掉。
+discard_tmp() {
+	rm -f "$1" 2>/dev/null || true
+}
+
 # 写入文件的统一入口：--check 时只报告，内容没变时不动它。
 #
 # "内容没变就不写"不只是为了让日志好看：这些文件里有 systemd 单元，
 # 每次触碰都会让下一步的 daemon-reload 真的重载，而重载之后跟不跟一次
-# restart 是很难一眼看出来的（见 step_caddy 的说明）。
+# restart 是很难一眼看出来的（见 step_reverse_proxy 的说明）。
 write_file() {
 	local path="$1" mode="$2" owner="$3" group="$4"
 	shift 4
@@ -148,13 +199,13 @@ write_file() {
 	cat >"$tmp"
 
 	if [ -f "$path" ] && cmp -s "$tmp" "$path"; then
-		rm -f "$tmp"
+		discard_tmp "$tmp"
 		ok "无变化 $path"
 		return 0
 	fi
 
 	if [ "$CHECK" = 1 ]; then
-		rm -f "$tmp"
+		discard_tmp "$tmp"
 		note "计划写入 $path（$mode $owner:$group）"
 		return 0
 	fi
@@ -190,6 +241,22 @@ copy_in() {
 		chown root:root "$dest"
 	fi
 	ok "已安装 $dest"
+}
+
+# 从 relay.env 里读一个键的值。取最后一条匹配（后面的覆盖前面的），去掉引号。
+read_env_value() {
+	local key="$1"
+	[ -f "$ENV_FILE" ] || return 0
+	grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true
+}
+
+# 某端口上持有 listen 的进程名（取第一个）。ss -p 需要 root 才能看到别人的进程。
+port_holder() {
+	local port="$1"
+	command -v ss >/dev/null 2>&1 || return 0
+	ss -lntpH "sport = :$port" 2>/dev/null |
+		sed -n 's/.*users:((\"\([^"]*\)\".*/\1/p' |
+		head -1
 }
 
 # ---------------------------------------------------------------- 各步骤
@@ -240,7 +307,13 @@ step_preflight() {
 step_packages() {
 	head_line "系统包"
 
-	local pkgs="python3 python3-venv python3-pip curl ufw fail2ban sqlite3 git ca-certificates gnupg"
+	# 刻意**不**包含 ufw 与 fail2ban：同机共存时，这两个装上就会被启用，
+	# 而它们的默认策略会去动网络——`ufw enable` 按 deny incoming 把共存服务
+	# 的端口一起挡掉，fail2ban 的 sshd jail 可能把部署者自己 ban 掉。
+	# 需要它们应该由运维单独决定，而不是被一次应用部署顺手带上来。
+	#
+	# git 也不在其中：代码是 release.sh 打包推上来的，服务器不需要拉仓库。
+	local pkgs="python3 python3-venv python3-pip curl ca-certificates sqlite3"
 	local missing=""
 	local p
 	for p in $pkgs; do
@@ -269,6 +342,9 @@ step_packages() {
 }
 
 step_timezone_swap() {
+	# 名字保留 swap，但时区从"设置"改成了"只报告"：改时区会连带改变这台机器上
+	# 其他服务的日志时间戳，属于运维决定而不是部署副作用。同机只跑 HopDrop 时
+	# 这个区别看不出来，共存机器上它是"日志对不上时间"这类问题的来源。
 	head_line "时区与 swap"
 
 	if [ "$SYS" = 0 ]; then
@@ -277,33 +353,27 @@ step_timezone_swap() {
 	fi
 
 	if command -v timedatectl >/dev/null 2>&1; then
-		if [ "$(timedatectl show -p Timezone --value 2>/dev/null)" = "Asia/Shanghai" ]; then
+		local tz
+		tz="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
+		if [ "$tz" = "Asia/Shanghai" ]; then
 			ok "时区已是 Asia/Shanghai"
 		else
-			sysrun timedatectl set-timezone Asia/Shanghai
+			warn "时区是 ${tz:-未知}，不是 Asia/Shanghai。"
+			warn "本脚本**不会**替你改：同机还有其他服务，改时区会连带改变它们的日志时间戳。"
+			warn "确实需要就手工执行：timedatectl set-timezone Asia/Shanghai"
 		fi
 	fi
 
-	# 2 GiB 内存跑 uvicorn + SQLite 够用，swap 是给系统留的余量。
+	# swap 同样只读。新建 swap 要改 /etc/fstab，属于系统级改动；
+	# 而机器上多半已经有运维配好的 swapfile，动它没有收益只有风险。
 	if swapon --show=NAME --noheadings 2>/dev/null | grep -q .; then
-		ok "已有 swap"
-		return
+		local swap_size
+		swap_size="$(free -h 2>/dev/null | awk '/^Swap:/ {print $2}')"
+		ok "已有 swap（${swap_size:-未知}），未改动"
+	else
+		warn "没有启用 swap。内存紧张的机器上一旦 OOM，被杀的是进程而不是缓存的页。"
+		warn "本脚本不替你创建（会改 /etc/fstab）。建议手工建 1–2 GiB 的 swapfile。"
 	fi
-	if [ -f /swapfile ]; then
-		note "/swapfile 已存在但未启用，尝试启用"
-		sysrun swapon /swapfile || warn "启用 /swapfile 失败，请手工检查"
-		return
-	fi
-
-	say "创建 1 GiB /swapfile"
-	sysrun fallocate -l 1G /swapfile || sysrun dd if=/dev/zero of=/swapfile bs=1M count=1024
-	sysrun chmod 600 /swapfile
-	sysrun mkswap /swapfile
-	sysrun swapon /swapfile
-	if ! grep -q '^/swapfile' /etc/fstab 2>/dev/null; then
-		sysrun sh -c "echo '/swapfile none swap sw 0 0' >> /etc/fstab"
-	fi
-	ok "swap 已启用"
 }
 
 step_user() {
@@ -329,7 +399,10 @@ step_dirs() {
 	head_line "数据目录"
 
 	local d
-	local dirs="$STATE_DIR $STATE_DIR/files $STATE_DIR/thumbs $STATE_DIR/backup $APP_DIR $ENV_DIR"
+	# tmp 是给 TMPDIR 用的：starlette 的 UploadFile 超过 1 MiB 就落临时文件，
+	# 而 PrivateTmp 给的 /tmp 是 tmpfs（占内存）。这台机器可用内存只有几百
+	# MiB，一次 20 MiB 的上传就会实打实吃掉 20 MiB。指到数据盘上没有这个问题。
+	local dirs="$STATE_DIR $STATE_DIR/files $STATE_DIR/thumbs $STATE_DIR/backup $STATE_DIR/tmp $APP_DIR $ENV_DIR"
 
 	for d in $dirs; do
 		if [ -d "$d" ]; then
@@ -358,7 +431,7 @@ step_dirs() {
 
 	# 数据目录必须只有服务账号能进：里面有房间数据库和用户上传的文件。
 	if [ "$CHECK" = 0 ] && [ "$SYS" = 1 ]; then
-		chmod 0700 "$STATE_DIR" "$STATE_DIR"/files "$STATE_DIR"/thumbs "$STATE_DIR"/backup 2>/dev/null || true
+		chmod 0700 "$STATE_DIR" "$STATE_DIR"/files "$STATE_DIR"/thumbs "$STATE_DIR"/backup "$STATE_DIR"/tmp 2>/dev/null || true
 	fi
 }
 
@@ -477,30 +550,412 @@ step_relay_unit() {
 	fi
 }
 
+# ------------------------------------------------------------ nginx 站点生成
+
+# 渲染 proxy 配置段。整段都是 nginx 字面量，只有上游地址需要插值，
+# 所以用带引号的 heredoc 避免一堆 \$ 转义——漏掉一个就会静默展开成空字符串，
+# 而那种配置大概率还能通过 nginx -t，问题要等到运行时才显形。
+render_nginx_proxy_body() {
+	cat <<'NGINX'
+    location / {
+        proxy_pass http://@UPSTREAM@;
+        proxy_http_version 1.1;
+
+        # **覆盖式**写 X-Forwarded-For，而不是 $proxy_add_x_forwarded_for。
+        #
+        # 应用侧的 client_ip() 取这个头的**第一个**值作为来源 IP，用于方案 10
+        # 的单 IP 连接上限。追加式写法会把客户端自己带来的值排在最前面，
+        # 于是任何人都能伪造来源 IP、绕过连接上限。覆盖之后，这里永远是
+        # nginx 看到的真实对端地址，伪造值进不来。
+        #
+        # 前提是 uvicorn 只监听 127.0.0.1（RELAY_ADDR 的默认值）。哪天把它
+        # 暴露到 0.0.0.0，这个头就重新变成客户端可控的。
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # Host 不带端口：应用的 same_origin() 拿 Origin 的 netloc 与 Host 头做
+        # 字符串相等比较，带上 :443 会让它不等——症状是 WebSocket 一律被拒，
+        # 而 HTTP 请求看着完全正常。
+        proxy_set_header Host $host;
+
+        # 单文件上限 20 MiB（config.MAX_FILE_BYTES_HARD_LIMIT）。
+        # nginx 默认是 1 MiB，不放开的话超过 1 MiB 的上传会被 nginx 直接 413，
+        # 请求根本到不了应用——应用侧自己的错误信息一条都不会出现，
+        # 排查时对着"上传失败"完全找不到线索。
+        client_max_body_size 24m;
+
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 300s;
+        proxy_read_timeout 300s;
+    }
+
+    # WebSocket 单独一个 location：只在 /ws 上开 Upgrade，
+    # 不把普通请求也标成 Connection: upgrade。
+    location = /ws {
+        proxy_pass http://@UPSTREAM@;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Host $host;
+
+        proxy_connect_timeout 5s;
+        # 客户端每 25 秒 ping 一次，应用侧 60 秒收不到活动就关连接。
+        # nginx 默认的 60s 正好卡在这个边界上，一轮网络抖动就可能切断——
+        # 表现是页面"偶尔自己刷新"，而服务端日志里什么都没有。
+        proxy_send_timeout 300s;
+        proxy_read_timeout 300s;
+    }
+
+    # 日志单独落文件，不与既有站点混在 /var/log/nginx/access.log 里。
+    access_log /var/log/nginx/hopdrop.access.log;
+    error_log  /var/log/nginx/hopdrop.error.log;
+NGINX
+}
+
+# 渲染完整站点配置。with_tls=1 时输出"80 跳转 + 443 反代"，否则只有 80 反代。
+render_nginx_site() {
+	local domain="$1" upstream="$2" with_tls="$3"
+	local body banner
+
+	body="$(render_nginx_proxy_body)"
+	banner="$(cat <<'NGINX'
+# HopDrop 反向代理站点。由 deploy/install.sh 生成，请勿手工修改——
+# 每次发布都会用仓库里的版本重写这个文件。
+#
+# 设计要点（改之前先读一遍）：
+#   * HopDrop 不持有 80/443，只作为既有 nginx 的一个 server 挂进来。
+#     这份配置从不重启 nginx，只在 `nginx -t` 通过后 reload。
+#   * X-Forwarded-For 用 $remote_addr **覆盖**而不是追加，原因见 location / 的注释。
+#   * 80 段与 443 段里的 proxy 配置是各写一遍的，没有抽成 include：
+#     这样运维打开这一个文件就能看全，不必跳到 snippets 目录再跳回来。
+#   * 这个文件按域名参数化生成，不含任何部署专属的手改内容，
+#     所以"每次发布整体重写"是安全的。
+NGINX
+)"
+
+	if [ "$with_tls" = 1 ]; then
+		{
+			printf '%s\n\n' "$banner"
+			cat <<'NGINX'
+server {
+    listen 80;
+    listen [::]:80;
+    server_name @DOMAIN@;
+
+    # certbot 用 webroot 方式签发，HTTP-01 挑战必须由文件系统应答，
+    # 而且要在 301 跳转之前接住。^~ 前缀匹配压过下面的 location /。
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/html;
+        default_type "text/plain";
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name @DOMAIN@;
+
+    ssl_certificate     /etc/letsencrypt/live/@DOMAIN@/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/@DOMAIN@/privkey.pem;
+    # 协议版本、加密套件、DH 参数。引用 certbot 生成的那两份而不是抄一份
+    # 进来，是为了让 TLS 参数随 certbot 一起更新。两者必然与证书同时存在
+    # ——证书就是 certbot 签的。
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    # HSTS。Caddy 在 HTTPS 下会自动加，nginx 不会——从 Caddy 切到 nginx 后
+    # 这一条是最容易丢的：域名照常能开、证书照样有效，只是"浏览器从此只用
+    # HTTPS 访问"这层保护静默消失了。
+    #
+    # **绝不加 includeSubDomains**：那会把 devilsarchive.cn 下的其它子域
+    # （translate / phound / minitalk）一起拖进强制 HTTPS，而这台机器上的
+    # 其它站点不归 HopDrop 管，给别人的域名下强制策略属于越界。也不加 preload。
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+NGINX
+			printf '%s\n' "$body"
+			printf '}\n'
+		}
+	else
+		{
+			printf '%s\n\n' "$banner"
+			cat <<'NGINX'
+server {
+    listen 80;
+    listen [::]:80;
+    server_name @DOMAIN@;
+
+    # 证书还没签时也用得上：certbot 的 webroot 挑战要由这个 location 接住。
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/html;
+        default_type "text/plain";
+    }
+
+NGINX
+			printf '%s\n' "$body"
+			printf '}\n'
+		}
+	fi | sed -e "s|@DOMAIN@|$domain|g" -e "s|@UPSTREAM@|$upstream|g"
+}
+
+# 证书是否存在。用 PREFIX 拼接，这样演练模式下也能被测试驱动。
+tls_cert_exists() {
+	[ -f "$PREFIX/etc/letsencrypt/live/$1/fullchain.pem" ]
+}
+
+# 站点配置的备份只保留最近几个。
+#
+# 这些 .before-* 是"刚改坏了能立刻退回去"的短期保险，不是归档。每次发布
+# 内容都会变，也就每次都留一份；不清理的话 sites-available 里会慢慢堆满
+# 同名不同戳的文件，而这些文件**仍然在 nginx 的 include 范围之外**（只 include
+# sites-enabled/*），所以不会造成故障，却会让目录越来越难读。
+prune_nginx_backups() {
+	local keep=5
+	local dir
+	dir="$(dirname "$NGINX_SITE")"
+	# 整个管道末尾挂 `|| true`：这是收尾动作，失败绝不能让部署停在这里。
+	# 本脚本开着 `set -e` + `pipefail`，而 while 跑在子 shell 里，任何一条
+	# rm 返回非 0（权限、文件被占、被安全策略拦）都会让管道整体失败，
+	# 进而中止整个部署——为了删掉一个无关紧要的旧备份，代价明显不划算。
+	ls -1t "$dir"/hopdrop.before-hopdrop-* 2>/dev/null |
+		tail -n "+$((keep + 1))" |
+		while IFS= read -r old; do
+			rm -f "$old" 2>/dev/null || true
+		done || true
+	return 0
+}
+
+# ------------------------------------------------------------ 反向代理分派
+
+step_reverse_proxy() {
+	local mode="$PROXY_MODE"
+
+	if [ "$mode" = "auto" ]; then
+		if [ "$SYS" = 0 ]; then
+			# 演练模式没有真实端口可探（PREFIX 挂在临时目录下），
+			# 按默认的 nginx 走，好让测试覆盖到这条分支。
+			mode="nginx"
+			note "演练模式：无法探测真实端口，按 nginx 处理（真实环境会自动探测）"
+		else
+			mode="$(detect_proxy)"
+			if [ -z "$mode" ]; then
+				mode="none"
+			else
+				say "探测到 80/443 由既有 $mode 持有；HopDrop 将作为它的一个 server 挂载，"
+				say "既不安装它，也不重启它。"
+			fi
+		fi
+	fi
+
+	RESOLVED_PROXY="$mode"
+
+	case "$mode" in
+	nginx) step_nginx ;;
+	caddy) step_caddy ;;
+	none) step_proxy_none ;;
+	*) die "未知的反代模式：$mode" ;;
+	esac
+}
+
+detect_proxy() {
+	local holder
+	# 先看 443：能签下证书的那台机器，443 上才是真正的对外入口。
+	for port in 443 80; do
+		holder="$(port_holder "$port")"
+		case "$holder" in
+		nginx | caddy) printf '%s\n' "$holder"; return 0 ;;
+		esac
+	done
+	return 0
+}
+
+step_proxy_none() {
+	head_line "反向代理"
+
+	warn "没有在 80/443 上探测到 nginx 或 Caddy，且未指定 --proxy。"
+	warn "HopDrop 只监听 127.0.0.1:8080，公网无法访问——本地验收没问题，"
+	warn "但配对用的二维码/链接在别的设备上打不开。"
+	warn "需要对外服务时，把既有反代指向 127.0.0.1:8080，或用 --proxy=nginx|caddy 指定。"
+}
+
+# ------------------------------------------------------------ nginx 分支
+
+step_nginx() {
+	head_line "nginx 站点（复用既有实例）"
+
+	# nginx 二进制只在真实系统上检查。演练模式（SYS=0）跑在本机，那里没有
+	# nginx——但站点渲染是纯文件生成，恰恰是演练最该覆盖的部分，所以不拦。
+	if [ "$SYS" = 1 ] && ! command -v nginx >/dev/null 2>&1; then
+		warn "80/443 由 nginx 持有，但当前 PATH 里找不到 nginx 命令；跳过站点配置。"
+		return
+	fi
+
+	local domain upstream
+	domain="$(read_env_value RELAY_DOMAIN)"
+	upstream="$(read_env_value RELAY_ADDR)"
+	[ -n "$upstream" ] || upstream="127.0.0.1:8080"
+
+	if [ -z "$domain" ]; then
+		warn "RELAY_DOMAIN 未配置，无法生成 server_name。"
+		warn "这台机器的 80 端口上 default_server 是别的服务，没有域名就分不出流量。"
+		warn "在 $ENV_FILE 里填好 RELAY_DOMAIN 后重跑本脚本。"
+		return
+	fi
+
+	local with_tls=0
+	if tls_cert_exists "$domain"; then
+		with_tls=1
+		ok "找到 $domain 的证书，生成 80 跳转 + 443 反代"
+	else
+		warn "找不到 $domain 的证书（$PREFIX/etc/letsencrypt/live/$domain/）。"
+		warn "本次只生成 HTTP 版（listen 80）。此时会话 Cookie 带着 Secure 属性，"
+		warn "浏览器会直接丢弃它——表现是"首页能打开、配对却总回到未登录"，"
+		warn "所以这只能用于首次连通性验收。签证书："
+		warn "  sudo bash $APP_DIR/deploy/certbot-hopdrop.sh $domain"
+		warn "签完重跑本脚本，会自动换成带 443 的版本。"
+	fi
+
+	local tmp
+	tmp="$(mktemp)"
+	render_nginx_site "$domain" "$upstream" "$with_tls" >"$tmp"
+
+	# 两件事分开判断：文件内容要不要更新、sites-enabled 里的软链要不要修。
+	# 合成一个条件会让"内容其实没变、只是软链不对"的情况也走一遍重写，
+	# 于是每跑一次就多一个 .before-* 备份，几天下来堆满 sites-available。
+	local need_write=0 need_link=0
+	if [ ! -f "$NGINX_SITE" ] || ! cmp -s "$tmp" "$NGINX_SITE"; then
+		need_write=1
+	fi
+	if [ "$(readlink "$NGINX_SITE_ENABLED" 2>/dev/null || true)" != "$NGINX_SITE" ]; then
+		need_link=1
+	fi
+
+	if [ "$need_write" = 0 ] && [ "$need_link" = 0 ]; then
+		discard_tmp "$tmp"
+		ok "站点配置无变化（$NGINX_SITE）"
+		return
+	fi
+
+	if [ "$CHECK" = 1 ]; then
+		discard_tmp "$tmp"
+		[ "$need_write" = 1 ] && note "计划写入 $NGINX_SITE"
+		[ "$need_link" = 1 ] && note "计划创建软链 $NGINX_SITE_ENABLED → $NGINX_SITE"
+		return
+	fi
+
+	# 动别人的东西之前先留退路。命名沿用这台机器上既有的惯例
+	# （见 sites-available/phound.before-redirect、fortranslate.before-pwa-*）。
+	local backup=""
+	if [ "$need_write" = 1 ]; then
+		if [ -f "$NGINX_SITE" ]; then
+			backup="$NGINX_SITE.before-hopdrop-$(date +%Y%m%d%H%M%S)"
+			cp -p "$NGINX_SITE" "$backup"
+			note "原配置已备份为 $backup"
+			prune_nginx_backups
+		fi
+
+		mkdir -p "$(dirname "$NGINX_SITE")"
+		mv "$tmp" "$NGINX_SITE"
+		chmod 0644 "$NGINX_SITE"
+		ok "已写入 $NGINX_SITE"
+	else
+		discard_tmp "$tmp"
+		ok "站点配置内容无变化"
+	fi
+
+	if [ "$need_link" = 1 ]; then
+		mkdir -p "$(dirname "$NGINX_SITE_ENABLED")"
+		local link_err
+		if link_err="$(ln -sfn "$NGINX_SITE" "$NGINX_SITE_ENABLED" 2>&1)"; then
+			ok "已启用 $NGINX_SITE_ENABLED"
+		elif ln "$NGINX_SITE" "$NGINX_SITE_ENABLED" 2>/dev/null; then
+			# 回退到硬链接。Windows 上创建符号链接需要特权（或开发者模式），
+			# 本机演练会撞上；而 nginx 只是读这个文件，硬链接语义上同样够用。
+			note "该文件系统不支持符号链接，已改用硬链接启用站点"
+		elif [ "$SYS" = 1 ]; then
+			# 真实服务器上启用失败就是部署失败：站点不会被 nginx 加载，
+			# 而"服务起着但访问 404"这种状态比直接报错难查得多。
+			die "无法启用 $NGINX_SITE_ENABLED：$link_err"
+		else
+			warn "演练环境无法创建链接（Linux 上会创建符号链接）：$link_err"
+		fi
+	fi
+
+	if [ "$SYS" = 0 ]; then
+		note "演练模式：跳过 nginx -t 与 reload"
+		return
+	fi
+
+	# ---------------------------------------------------------------- 关键
+	# 校验通过才 reload。这台机器上还有别的站点，把一份语法错误的配置
+	# reload 进去，结果是"所有站点一起挂"，而且就在 reload 的那一刻发生。
+	if nginx -t >/dev/null 2>&1; then
+		ok "nginx -t 通过"
+	else
+		printf '\n' >&2
+		nginx -t 2>&1 | sed 's/^/    /' >&2
+		# 回滚本身也要容错。好消息是：走到这里时**还没有 reload**，
+		# 所以 nginx 跑着的仍是旧配置，其他站点是安全的——回滚失败只是
+		# 让磁盘上的文件脏了，不会造成线上故障。因此这里全部 warn 不 die，
+		# 把"没有 reload"这个关键事实留给最后那句 die 说清楚。
+		if [ -n "$backup" ]; then
+			if cp -p "$backup" "$NGINX_SITE" 2>/dev/null; then
+				note "已从 $backup 恢复原配置"
+			else
+				warn "恢复 $backup 失败。nginx 未受影响（没有 reload），但请手工核对 $NGINX_SITE。"
+			fi
+		else
+			rm -f "$NGINX_SITE_ENABLED" "$NGINX_SITE" 2>/dev/null || true
+			note "已移除本次新建的站点文件与软链"
+		fi
+		die "nginx 配置校验失败。**未执行 reload**——nginx 的状态与本脚本运行前一致，
+其他站点不受影响。修正上面的语法问题后重跑本脚本即可。"
+	fi
+
+	# reload 而不是 restart：reload 平滑，既有连接不断；
+	# restart 会把这台机器上所有站点瞬断一次。
+	sysrun systemctl reload nginx
+	ok "nginx 已 reload（未重启，其他站点不受影响）"
+
+	if [ "$with_tls" = 0 ]; then
+		warn "当前是 HTTP 版站点；签完证书后重跑本脚本即可切换为 HTTPS。"
+	fi
+
+	# 配了域名但没配备案号时，浏览器能打开但首页少一行监管信息。
+	local icp
+	icp="$(read_env_value RELAY_ICP_LICENSE)"
+	if [ -z "$icp" ]; then
+		warn "RELAY_ICP_LICENSE 仍为空：上线前必须补上（方案 11.1 / 第 13 节）。"
+	fi
+}
+
+# ------------------------------------------------------------ Caddy 分支
+#
+# 非默认路径：只在目标机本来就跑着 Caddy 时走这条。
+# Caddy 会自动申请证书，所以不需要单独的 certbot 步骤。
+
 step_caddy() {
 	head_line "Caddy"
 
 	if ! command -v caddy >/dev/null 2>&1; then
-		say "安装 Caddy（官方 APT 源）"
-		if [ "$CHECK" = 1 ]; then
-			note "计划执行 Caddy 官方源安装"
-		else
-			sysrun sh -c "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg"
-			sysrun sh -c "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null"
-			sysrun apt-get update -qq
-			sysrun env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends caddy
-			sysrun apt-get clean
-		fi
-	else
-		ok "Caddy 已安装（$(caddy version 2>/dev/null | head -1)）"
+		warn "80/443 由 Caddy 持有，但当前 PATH 里找不到 caddy 命令；跳过站点配置。"
+		return
 	fi
+
+	ok "Caddy 已安装（$(caddy version 2>/dev/null | head -1)）"
 
 	# 让 Caddy 能读到 RELAY_DOMAIN。Caddyfile 里写的是 {$RELAY_DOMAIN::80}，
 	# 意思是"取环境变量，没有就用 :80（纯 HTTP）"。把 relay.env 作为
 	# EnvironmentFile 注入，域名就只需要维护一处。
 	#
-	# 注意 relay.env 是 0600 root:root——systemd 以 root 读 EnvironmentFile，
-	# 权限没问题，Caddy 的子进程也能继承到这个变量。
 	# 用 drop-in 而不是改 Caddy 官方 unit：apt 升级 Caddy 时官方 unit 会被重写，
 	# 改动放 drop-in 才不会丢。
 	write_file "$CADDY_DROPIN" 0644 root root <<EOF
@@ -537,11 +992,8 @@ EOF
 		fi
 	fi
 
-	# 域名没配时给一条明确提示，别让人对着"证书签不下来"的日志猜。
-	local domain=""
-	if [ -f "$ENV_FILE" ]; then
-		domain="$(awk -F= '/^RELAY_DOMAIN=/ {print $2}' "$ENV_FILE" | tr -d '"' | tail -1)"
-	fi
+	local domain
+	domain="$(read_env_value RELAY_DOMAIN)"
 	if [ -z "$domain" ]; then
 		warn "RELAY_DOMAIN 未配置：Caddy 会以纯 HTTP（:80）提供服务。"
 		warn "此时 HTTPS 不可用，带 Secure 的会话 Cookie 会被浏览器丢弃——"
@@ -553,31 +1005,27 @@ step_firewall() {
 	head_line "防火墙"
 
 	if [ "$SYS" = 0 ]; then
-		note "跳过（演练模式）：ufw"
-		return
-	fi
-	if ! command -v ufw >/dev/null 2>&1; then
-		note "未安装 ufw，跳过"
+		note "跳过（演练模式）：防火墙"
 		return
 	fi
 
-	# 只放行、不 enable。这条区别很重要：这台机器上跑着共存服务，
-	# 如果 ufw 本来是关的，`ufw enable` 会立刻按默认策略（deny incoming）
-	# 把别人的端口一起挡掉。开不开防火墙应该由运维决定，不该由部署脚本顺手决定。
-	local port
-	for port in 80 443; do
-		if ufw status 2>/dev/null | grep -qE "^${port}(/tcp)?[[:space:]]+ALLOW"; then
-			ok "已放行 $port/tcp"
-		else
-			sysrun ufw allow "${port}/tcp"
+	# 这个脚本**一条防火墙规则都不加**，只报告现状。理由：
+	#   * 复用既有反代时，80/443 的放行属于既有服务，不该由应用部署脚本代管；
+	#   * 没有反代时 HopDrop 只在回环上，也不需要放行；
+	#   * 装 ufw 这件事本身就有风险——它一旦被 enable，就按默认策略
+	#     deny incoming 把共存服务的端口一起挡掉。
+	# 所以决定权留给运维，这里只把现状说清楚。
+	if command -v ufw >/dev/null 2>&1; then
+		local state
+		state="$(ufw status 2>/dev/null | head -1 || true)"
+		say "ufw：${state:-状态未知}"
+		if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+			note "ufw 未启用；本脚本不会替你启用它（同机有共存服务）。"
 		fi
-	done
-
-	if ! ufw status 2>/dev/null | grep -q "Status: active"; then
-		warn "ufw 当前未启用，且本脚本**不会**替你启用它。"
-		warn "同机有共存服务，贸然 enable 会按默认策略挡掉其他端口。"
-		warn "确认过放行清单后自行执行：ufw allow 22/tcp && ufw enable"
+	else
+		say "未安装 ufw（本脚本也不会安装它）"
 	fi
+	note "HopDrop 不需要新增防火墙规则：对外入口由既有反代承担，服务本身只在回环。"
 }
 
 step_backup_cron() {
@@ -662,27 +1110,37 @@ step_verify() {
 		return
 	fi
 
-	local addr="127.0.0.1:8080"
-	if [ -f "$ENV_FILE" ]; then
-		local from_env
-		from_env="$(awk -F= '/^RELAY_ADDR=/ {print $2}' "$ENV_FILE" | tail -1)"
-		[ -n "$from_env" ] && addr="$from_env"
-	fi
+	local addr
+	addr="$(read_env_value RELAY_ADDR)"
+	[ -n "$addr" ] || addr="127.0.0.1:8080"
 
 	if ! command -v curl >/dev/null 2>&1; then
 		note "没有 curl，跳过"
 		return
 	fi
 
-	local body code
-	body="$(curl -fsS --max-time 5 "http://$addr/healthz" 2>/dev/null)" && code=0 || code=$?
-	if [ "$code" != 0 ]; then
-		warn "http://$addr/healthz 请求失败（curl 退出码 $code）。"
-		warn "服务可能还在启动，或处于 degraded（degraded 会返回 503，curl -f 视为失败）。"
-		say "手工确认：curl -i http://$addr/healthz"
-		return
-	fi
-	ok "健康检查通过：$body"
+	# 不用 `curl -f`：degraded 时应用返回 503 并**在响应体里给出 reasons**，
+	# 而 -f 会连响应体一起丢掉——排查时最需要的那几个字正好被扔了。
+	# --fail-with-body 保留退出码语义，同时把 body 留下。
+	local raw code body
+	raw="$(curl -sS --max-time 5 --fail-with-body -w '\n%{http_code}' "http://$addr/healthz" 2>/dev/null)" || true
+	code="${raw##*$'\n'}"
+	body="${raw%$'\n'*}"
+
+	case "$code" in
+	200)
+		ok "健康检查通过：${body:-（响应体为空）}"
+		;;
+	503)
+		warn "服务活着但处于 degraded（HTTP 503）："
+		printf '         %s\n' "$body" >&2
+		warn "reasons 字段就是原因；磁盘配额或数据目录不可写是最常见的两条。"
+		;;
+	*)
+		warn "http://$addr/healthz 无响应（HTTP ${code:-000}）。"
+		warn "服务可能还在启动。手工确认：curl -i http://$addr/healthz"
+		;;
+	esac
 }
 
 summary() {
@@ -691,6 +1149,10 @@ summary() {
 		say "以上是 --check 的报告，未做任何改动。"
 		return
 	fi
+
+	local domain
+	domain="$(read_env_value RELAY_DOMAIN)"
+
 	cat <<EOF
   服务：systemctl status relay
   日志：journalctl -u relay -f
@@ -698,6 +1160,25 @@ summary() {
   配置：$ENV_FILE
   数据：$STATE_DIR
 EOF
+
+	case "$RESOLVED_PROXY" in
+	nginx)
+		if [ -n "$domain" ]; then
+			if tls_cert_exists "$domain"; then
+				printf '  入口：https://%s/\n' "$domain"
+			else
+				printf '  入口：http://%s/（尚未签证书，见上面的提示）\n' "$domain"
+			fi
+		else
+			printf '  入口：未配置（%s 里补上 RELAY_DOMAIN）\n' "$ENV_FILE"
+		fi
+		printf '  站点：%s（软链 %s）\n' "$NGINX_SITE" "$NGINX_SITE_ENABLED"
+		printf '  反代日志：/var/log/nginx/hopdrop.*.log\n'
+		;;
+	caddy)
+		[ -n "$domain" ] && printf '  入口：https://%s/\n' "$domain"
+		;;
+	esac
 }
 
 main() {
@@ -711,8 +1192,9 @@ main() {
 
 	printf 'HopDrop 服务器部署%s\n' "$([ "$CHECK" = 1 ] && echo '（--check 模式）' || true)"
 	printf '  前缀：%s\n' "$PREFIX"
+	printf '  反代：%s\n' "$PROXY_MODE"
 	if [ "$SYS" = 0 ]; then
-		printf '  模式：演练（跳过 apt / ufw / systemd / useradd）\n'
+		printf '  模式：演练（跳过 apt / 系统服务 / useradd）\n'
 	fi
 
 	step_preflight
@@ -723,7 +1205,7 @@ main() {
 	step_venv
 	step_env_file
 	step_relay_unit
-	step_caddy
+	step_reverse_proxy
 	step_firewall
 	step_backup_cron
 	step_health_timer

@@ -289,10 +289,11 @@ step "部署完成"
 if [ -n "$DOMAIN" ]; then
 	# 只更新 RELAY_DOMAIN 一行，其余保持原样。写在 install.sh 之后：
 	# install.sh 生成 relay.env 时用的是模板，模板里这一项是空的。
-	# 网关地址（RELAY_ADDR）不动，那是 Caddy 反代的目标。
-	ssh "$HOST" "bash -s -- '$DOMAIN'" <<'REMOTE'
+	# 监听地址（RELAY_ADDR）不动，那是反向代理指向的上游。
+	ssh "$HOST" "bash -s -- '$DOMAIN' '$APP_DIR'" <<'REMOTE'
 set -euo pipefail
 DOMAIN="$1"
+APP_DIR="$2"
 ENV_FILE=/etc/relay/relay.env
 [ -f "$ENV_FILE" ] || { printf 'relay.env 不存在，跳过域名写入\n' >&2; exit 0; }
 if grep -q '^RELAY_DOMAIN=' "$ENV_FILE"; then
@@ -301,7 +302,13 @@ else
 	printf '\n# 由 release.sh --domain 写入\nRELAY_DOMAIN=%s\n' "$DOMAIN" >>"$ENV_FILE"
 fi
 printf 'RELAY_DOMAIN=%s 已写入 %s\n' "$DOMAIN" "$ENV_FILE"
-systemctl restart relay caddy 2>/dev/null || true
+
+# 站点文件是按 RELAY_DOMAIN 渲染的，而上面那次 install.sh 跑到时这一项还是空的
+# （relay.env 刚由它自己从模板生成）。所以必须再跑一次——这是唯一会生成 nginx
+# 站点的地方。少了这一步：域名填了、vhost 却没有，80 端口的请求会掉到这台机器
+# 的 default_server（minitalk）上，症状是"用自己的域名访问，看到的却是别人的站"。
+printf '  %s\n' "重跑 install.sh，按新域名生成 nginx 站点"
+bash "$APP_DIR/deploy/install.sh"
 REMOTE
 	say "域名已配置：$DOMAIN"
 fi

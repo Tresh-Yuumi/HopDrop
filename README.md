@@ -25,7 +25,7 @@ relay/                  服务端
     realtime.py         WebSocket 连接表与按房间广播
     rooms.py            房间引导（含两个初始区域）与 rev 递增
     security.py         随机值与哈希
-    security_headers.py 安全响应头（与 deploy/Caddyfile 同源）
+    security_headers.py 安全响应头（与 deploy 下的反代配置同源）
     snapshot.py         全量快照组装
     state.py            进程内运行时状态
   migrations/           NNNN_名称.sql，启动时自动应用
@@ -42,11 +42,12 @@ relay/                  服务端
   tests/                pytest
   relay.env.example     配置样例
 deploy/                 部署件（用法见 deploy/RUNBOOK.md）
-  RUNBOOK.md            部署手册：首次部署、发布、回滚、验收、故障处置
+  RUNBOOK.md            部署手册：目标机现状、首次部署、发布、回滚、验收、故障处置
   install.sh            服务器初始化（幂等；--check / --prefix 演练）
   release.sh            开发机侧发布：打包 + 校验 + 推送 + 调 install.sh
   rollback.sh           服务器侧回滚：代码与数据库
-  Caddyfile             反向代理（域名走 RELAY_DOMAIN 环境变量）
+  certbot-hopdrop.sh    签证书（certonly --webroot，不改写 nginx 配置）
+  Caddyfile             备用反代配置（目标机用的是 nginx，见 install.sh）
   relay.service         systemd unit
   backup.sh             每日数据库备份
   hopdrop-healthcheck.sh / .service / .timer   每分钟健康检查
@@ -149,7 +150,7 @@ bash deploy/install.sh --prefix /tmp/hopdrop-drill
 | M3 | 文本区与消息 CRUD（含 `mutation_id` 幂等与 `rooms.rev`） | 已完成 |
 | M4 | WebSocket 推送与快照对齐 | 已完成 |
 | M5 | 前端页面（文本闭环可点通） | 已完成 |
-| M6 | 首次真部署（Caddy + systemd + HTTPS） | 已完成（部署件与演练完成；真机执行待域名） |
+| M6 | 首次真部署（与既有 nginx 共存 + systemd + HTTPS） | 部署件与演练完成；真机执行待域名与备案号 |
 | M7 | 文件上传与下载 | 待做 |
 | M8 | 配额与清理任务 | 待做 |
 | M9 | 访客与生命周期（可延后，不返工） | 待做 |
@@ -159,7 +160,7 @@ M1–M6 构成方案的阶段 1（文本闭环）。M9 与 M10 是纯新增模�
 
 ### M1 完成范围与已知缺口
 
-已完成：迁移建出 8 张表 + `schema_version`；`/healthz` 按方案 14.5 返回结构化 JSON 并在不健康时返回 503；统一错误信封与 `X-Request-Id`；`/api/*` 响应 `Cache-Control: no-store`；Caddyfile、systemd unit、备份脚本。
+已完成：迁移建出 8 张表 + `schema_version`；`/healthz` 按方案 14.5 返回结构化 JSON 并在不健康时返回 503；统一错误信封与 `X-Request-Id`；`/api/*` 响应 `Cache-Control: no-store`；反向代理配置、systemd unit、备份脚本。
 
 尚未接入，属后续里程碑：
 
@@ -218,7 +219,7 @@ M1–M6 构成方案的阶段 1（文本闭环）。M9 与 M10 是纯新增模�
 
 ### M5 完成范围与已知缺口
 
-已完成：首页（用途说明、保留规则、主人入口、备案号可配置）与应用页外壳（顶栏 / 区域导航 / 消息流 / 输入区 / 设置抽屉），**服务端渲染、零内联样式与脚本**；`relay/web/` 下的 `app.css` 与 8 个按职责拆分的脚本，**无构建步骤**，语法限制在 Chromium 87 子集；`GET /api/boards/{id}/export?format=txt|md`；安全响应头在代码内统一下发（不依赖 Caddy 也在，且有测试比对 Caddyfile 防止两份漂移）。
+已完成：首页（用途说明、保留规则、主人入口、备案号可配置）与应用页外壳（顶栏 / 区域导航 / 消息流 / 输入区 / 设置抽屉），**服务端渲染、零内联样式与脚本**；`relay/web/` 下的 `app.css` 与 8 个按职责拆分的脚本，**无构建步骤**，语法限制在 Chromium 87 子集；`GET /api/boards/{id}/export?format=txt|md`；安全响应头在代码内统一下发（不依赖反向代理也在，且有测试比对反代配置防止两份漂移）。
 
 四条实现上的取定（第 5 条是**方案没要求、但真机跑一遍就会发现不该没有**的一处补充）：
 
@@ -244,21 +245,29 @@ M1–M6 构成方案的阶段 1（文本闭环）。M9 与 M10 是纯新增模�
 
 ### M6 完成范围与已知缺口
 
-已完成：`deploy/install.sh`（幂等，含 `--check` 与 `--prefix/--no-system` 本机演练）、`deploy/release.sh`（打包 → 远端校验 sha256 → 备份旧代码 → 铺新代码 → 调 install.sh）、`deploy/rollback.sh`（代码与数据库，数据库回滚会清 WAL）、`hopdrop-healthcheck` 与每分钟的 systemd timer、`deploy/RUNBOOK.md`、`relay/tests/test_deploy.py`（41 项）。
+已完成：`deploy/install.sh`（幂等，含 `--check` 与 `--prefix/--no-system` 本机演练）、`deploy/release.sh`（打包 → 远端校验 sha256 → 备份旧代码 → 铺新代码 → 调 install.sh）、`deploy/rollback.sh`（代码与数据库，数据库回滚会清 WAL）、`deploy/certbot-hopdrop.sh`（`certonly --webroot`，不改写 nginx 配置）、`hopdrop-healthcheck` 与每分钟的 systemd timer、`deploy/RUNBOOK.md`、`relay/tests/test_deploy.py` 与 `relay/tests/test_nginx_site.py`。
 
 **部署动作本身还没在真机上执行过**——缺域名与备案号，见 RUNBOOK 第一节。部署件、演练与验收清单都已就绪，拿到域名即可执行。
 
-七条实现上的取定：
+**一条改变了整体设计的约束：目标机的 80/443 上是既有的 nginx，不是空的。** 那台机器上还跑着 minitalk（占着 80 端口的 `default_server`）、fortranslate（:18787）、phound、postgres、memos，可用内存只剩三百多 MiB。所以 HopDrop 不是"装一个反代"，而是"作为既有 nginx 的一个 server 块挂进去"。由此派生出的取定：
 
-1. **代码用 `tar | ssh` 推，不在服务器上配 git。** 仓库是私有的，服务器拉代码要再配一份部署密钥与仓库权限；这是一个单人项目、一台机器，把 `relay/` 的内容铺过去就够了。代价是服务器上没有提交历史，靠包里的 `MANIFEST.txt` 记版本。
-2. **目录布局是"铺平"的**：`/opt/relay/app/main.py`，而不是 `/opt/relay/relay/app/`。这是被 `relay.service` 里的 `WorkingDirectory=/opt/relay` + `-m uvicorn app.main:app` 决定的。`install.sh` 的预检会直接拦住铺错层级的情况——那种错误的报错是 `ModuleNotFoundError: app`，离原因很远。
-3. **Caddyfile 里不含任何部署专属信息**，域名走 `RELAY_DOMAIN`，由 systemd drop-in 把 `relay.env` 注进 Caddy 进程。这样 Caddyfile 可以随每次发布被整体覆盖；一旦写死域名，"自动更新它"就不成立了。
-4. **域名没配时 Caddy 降级到 `:80` 纯 HTTP**（站点地址写成 `{$RELAY_DOMAIN::80}`）。给一个像 `relay.example.com` 这样的占位默认值，后果是 Caddy 拿着它反复申请证书、日志刷满，而"域名没配"这条真正的原因一条都不提。
-5. **`install.sh` 绝不覆盖已存在的 `/etc/relay/relay.env`**，只报告模板里新增的键。里面有部署者填的域名与备案号，覆盖一次就没了。这条有测试真跑两遍锁住。
-6. **健康检查默认不自动重启服务。** degraded 的原因里，磁盘余量不足、超配额、清理任务失败这三类，重启一次都修不好，只会把现场清掉。真正需要重启的是"进程活着但不响应"，要显式打开 `--restart-after`。
-7. **`ufw` 只放行、不启用。** 同机有共存服务，`ufw enable` 会按默认策略挡掉别人的端口，这个决定留给运维。
+1. **只 reload、从不 restart nginx。** reload 是平滑的，既有连接不断；restart 会把这台机器上所有站点一起瞬断——而它们跟这次发布毫无关系。有测试锁住 `install.sh` 里不出现 `restart nginx`。
+2. **流程固化为"写文件 → `nginx -t` → 通过才 reload"。** 顺序反了的话，一份语法错误的配置会在 reload 那一刻把所有站点一起打挂。校验失败时**自动回滚文件、明确不执行 reload**，并打印「nginx 的状态与本脚本运行前一致」——留着坏配置的话，下一次任何原因触发的 reload（比如 certbot 续期）都会把它读进去，那时已经离本次部署很远了。
+3. **`X-Forwarded-For` 用 `$remote_addr` 覆盖写，不用 nginx 文档里最常见的 `$proxy_add_x_forwarded_for`。** 应用侧的 `client_ip()` 取这个头的**第一个**值当来源 IP，用于方案 10 的单 IP 连接上限。追加式写法会把客户端自带的伪造值排在真实地址前面——**任何人加一个请求头就能绕过连接上限**。原来 `client_ip()` 的注释写着"由 Caddy 覆写"，而 Caddy 是自动覆盖的；换成 nginx 后这个前提不再自动成立，所以既改了站点配置，也改了那段注释。
+4. **站点自带 `client_max_body_size 24m`。** nginx 全局没设这一项（默认 1 MiB），而应用的单文件上限是 20 MiB。不放开的话，超过 1 MiB 的上传会被 nginx 直接 413，请求根本到不了应用——应用自己那条清晰的错误信息一条都不会出现。24m 是对 20 MiB 留出的余量，有测试断言"反代上限必须大于应用上限"。
+5. **HSTS 显式写在 443 段，且不带 `includeSubDomains`。** Caddy 在 HTTPS 下会自动加 HSTS，nginx 不会——切过来之后这一条最容易静默丢失：域名照常能开、证书照样有效，只是"浏览器从此只用 HTTPS"这层保护没了。而带上 `includeSubDomains` 会把 `devilsarchive.cn` 下的其它子域（translate / phound / minitalk）一起拖进强制 HTTPS，那些站点不归 HopDrop 管，给别人的域名下强制策略属于越界。所以既加了 HSTS，也用测试锁住"不得带 includeSubDomains / preload"。
+6. **不装 ufw/fail2ban、不改时区与 swap。** `ufw enable` 会按默认策略 deny incoming，把共存服务的端口一起挡掉；fail2ban 装上会启用 sshd jail，可能把部署者自己 ban 掉。时区、swap、内核参数一律只报告不修改——脚本里出现 `timedatectl set-timezone` 是给部署者的提示文字，有测试区分"提到"和"执行"。
 
-另外两点：`relay.service` 加了 `PYTHONDONTWRITEBYTECODE=1`（`ProtectSystem=strict` 下写不了 `__pycache__`，不加也不会报错，只是每次启动白编译一遍）；健康检查脚本用 `curl --fail-with-body` 而不是 `-f`——`-f` 在 503 时**不给响应体**，而 degraded 的原因恰好就在响应体里，这条是写测试时才发现的。
+另外三点：
+
+- **`relay.service` 加了内存护栏 `MemoryHigh=192M` / `MemoryMax=256M`。** 可用内存只有三百多 MiB，没有上限时 HopDrop 一旦内存泄漏，内核会在整机范围内挑进程杀——被挑中的可能是 minitalk 或 postgres。设了 cgroup 上限之后，被杀的只可能是 HopDrop 自己（`Restart=on-failure` 会拉起来）。同时 `TMPDIR` 指到 `/var/lib/relay/tmp`：`PrivateTmp` 给的 `/tmp` 是 tmpfs，那 20 MiB 的上传会实打实吃掉 20 MiB 内存。
+- **`--proxy-headers --forwarded-allow-ips 127.0.0.1`。** 让 uvicorn 采用反代传来的头，但只信来自回环的，也就是只信本机的 nginx。
+- **健康检查脚本用 `curl --fail-with-body` 而不是 `-f`。** `-f` 在 503 时**不给响应体**，而 degraded 的原因恰好就在响应体里——排查时最需要的字段被丢掉了。这是写测试时发现的：断言 `reasons` 出现在日志，实际拿到 `reasons=[]`。
+
+还有两处只在真机上才会暴露、提前堵掉的坑：
+
+- **本机 `core.autocrlf=true` 会把 `deploy/*.sh` 以 CRLF 检出**，到 Linux 上直接 `bad interpreter: No such file or directory`——报错信息完全指不到真正的原因。加了 `.gitattributes` 钉死 `eol=lf`，并在全新 clone 里复验过。
+- **首次部署时站点是在写完域名之后才生成的。** 站点文件按 `RELAY_DOMAIN` 渲染，而 `relay.env` 是 `install.sh` 第一次跑时从模板生成的（那一项为空，于是跳过站点生成）。所以 `release.sh` 在写完域名后**必须再跑一次 `install.sh`**；少了这一步，域名填了、vhost 却不存在，80 端口的请求会落到这台机器的 `default_server`（minitalk）上，症状是"用自己的域名访问，看到的却是别人的站点"。
 
 尚未接入，属后续里程碑：
 

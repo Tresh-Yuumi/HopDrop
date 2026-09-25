@@ -17,14 +17,34 @@ User=relay
 Group=relay
 WorkingDirectory=/opt/relay
 EnvironmentFile=/etc/relay/relay.env
+
 # ProtectSystem=strict 让 /opt/relay 只读，Python 写不了 __pycache__。
 # 不加这条不会报错——Python 会静默跳过缓存写入，每次启动重新编译一遍源码；
 # 加了省掉这次无用功，也让"为什么线上没有 .pyc"不再是个需要查的疑问。
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/opt/relay/venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8080 --no-access-log
+
+# starlette 的 UploadFile 超过 1 MiB 就落临时文件，而 PrivateTmp 给的 /tmp
+# 是 tmpfs——那是内存。目标机上可用内存只有三百多 MiB（还跑着别的服务），
+# 一次 20 MiB 的上传会实打实吃掉 20 MiB。指到数据盘就没这个问题，
+# 那块盘还剩 31 GiB。目录由 install.sh 创建，且在下面的 ReadWritePaths 之内。
+Environment=TMPDIR=/var/lib/relay/tmp
+
+# --proxy-headers：让 uvicorn 采用反代传来的 X-Forwarded-For / X-Forwarded-Proto。
+# --forwarded-allow-ips：限定只信任来自回环的这两个头，也就是只信 nginx。
+# 反代站点里那个头是用 $remote_addr **覆盖**写的（不是追加），
+# 所以 uvicorn 看到的就是真实对端地址，客户端伪造不了。
+ExecStart=/opt/relay/venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8080 --no-access-log --proxy-headers --forwarded-allow-ips 127.0.0.1
 Restart=on-failure
 RestartSec=3
 UMask=0077
+
+# 内存护栏。这台机器上还跑着 minitalk(107M) / fortranslate(72M) / postgres，
+# 可用内存只有三百多 MiB。设了上限之后，即使 HopDrop 出现内存泄漏，被 OOM
+# 杀掉的是它自己（Restart=on-failure 会重新拉起），而不是把整机拖垮、
+# 连带影响同机的其他服务——这正是"不能影响别人"在工程上的落点。
+# 正常负载下 RSS 在 60–90 MiB 之间，这里的数字是给"跑飞"留的余量。
+MemoryHigh=192M
+MemoryMax=256M
 
 NoNewPrivileges=true
 PrivateTmp=true

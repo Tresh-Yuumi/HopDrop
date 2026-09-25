@@ -156,7 +156,7 @@ def test_relay_unit_never_uses_workers() -> None:
     exec_lines = [line for line in lines if line.startswith("ExecStart=")]
     assert len(exec_lines) == 1, "relay.service 里应恰好有一条 ExecStart"
     assert "--host 127.0.0.1 --port 8080" in exec_lines[0], (
-        "服务只应监听回环，对外由 Caddy 反代"
+        "服务只应监听回环，对外由反向代理承担"
     )
 
 
@@ -377,8 +377,6 @@ def test_install_drill_lifecycle(drill_prefix: Path) -> None:
     for rel in (
         "etc/relay/relay.env",
         "etc/systemd/system/relay.service",
-        "etc/systemd/system/caddy.service.d/10-hopdrop.conf",
-        "etc/caddy/Caddyfile",
         "etc/cron.d/hopdrop-backup",
         "etc/systemd/system/hopdrop-healthcheck.timer",
         "usr/local/bin/hopdrop-backup",
@@ -386,6 +384,8 @@ def test_install_drill_lifecycle(drill_prefix: Path) -> None:
         "var/lib/relay/files",
         "var/lib/relay/thumbs",
         "var/lib/relay/backup",
+        # TMPDIR 的目标：上传超过 1 MiB 时的落盘位置（unit 里有对应设置）。
+        "var/lib/relay/tmp",
     ):
         assert (drill_prefix / rel).exists(), f"install.sh 没有生成 {rel}"
 
@@ -427,6 +427,15 @@ def test_install_drill_lifecycle(drill_prefix: Path) -> None:
     assert hashlib.sha256(env_file.read_bytes()).hexdigest() == marker
     assert "RELAY_DOMAIN=relay.hopdrop.cn" in env_file.read_text(encoding="utf-8")
     assert "不覆盖" in third.stdout
+
+    # 填好域名之后才会生成反代站点：没有域名就配不出 server_name，
+    # 而这个脚本宁可不配，也不拿一个猜测的值去顶——目标机 80 端口上的
+    # default_server 是别的服务，server_name 写错就会把流量串过去。
+    assert (drill_prefix / "etc/nginx/sites-available/hopdrop").is_file(), (
+        "填好 RELAY_DOMAIN 后重跑应当生成 nginx 站点"
+    )
+    site = (drill_prefix / "etc/nginx/sites-available/hopdrop").read_text(encoding="utf-8")
+    assert "server_name relay.hopdrop.cn;" in site
 
     # ---------- 阶段 4：--check 不写任何东西 ----------
     before_check = tree_digest(drill_prefix)
